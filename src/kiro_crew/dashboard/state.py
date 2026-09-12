@@ -3539,6 +3539,7 @@ class _ChatSlot:
         *,
         directive_user_origin: bool = False,
         directive_channel_origin: bool = False,
+        ingress: str = "",
     ) -> str:
         return self._queue_repository.queue_append(
             self,
@@ -3547,6 +3548,7 @@ class _ChatSlot:
             meta,
             directive_user_origin=directive_user_origin,
             directive_channel_origin=directive_channel_origin,
+            ingress=ingress,
         )
 
     def _note_enqueue(self) -> None:
