@@ -246,7 +246,7 @@ class TestDestroy:
         monkeypatch.setattr(
             CloudConfig, "load", classmethod(lambda cls, *a: CloudConfig(last_tag="kc-1"))
         )
-        monkeypatch.setattr(CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(CloudConfig, "_replace_file", lambda self, *a, **k: None)
         rc = cli_cloud._cloud_destroy(
             _args(profile="", region="", tag="kc-1", dry_run=False, yes=True)
         )
@@ -277,7 +277,7 @@ class TestDestroy:
         monkeypatch.setattr(
             CloudConfig, "load", classmethod(lambda cls, *a: CloudConfig(last_tag="kc-1"))
         )
-        monkeypatch.setattr(CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(CloudConfig, "_replace_file", lambda self, *a, **k: None)
         rc = cli_cloud._cloud_destroy(
             _args(profile="", region="", tag="kc-1", dry_run=False, yes=True)
         )
@@ -304,7 +304,9 @@ class TestDestroy:
         monkeypatch.setattr(
             CloudConfig, "load", classmethod(lambda cls, *a: CloudConfig(last_tag="kc-1"))
         )
-        monkeypatch.setattr(CloudConfig, "save", lambda self, *a: saved.update(n=saved["n"] + 1))
+        monkeypatch.setattr(
+            CloudConfig, "_replace_file", lambda self, *a, **k: saved.update(n=saved["n"] + 1)
+        )
         monkeypatch.setattr(connect_mod, "unregister_instance", lambda *a, **k: True)
 
         rc = cli_cloud._cloud_destroy(

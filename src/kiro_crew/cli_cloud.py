@@ -317,7 +317,9 @@ def _cloud_logout(args: argparse.Namespace) -> int:
         ui.detail("The session may still be active — retry, or check with: kirocrew cloud connect")
         return 1
     ui.ok("Signed out on the instance.")
-    ui.detail("Any in-flight chats/cron sessions were stopped (their kiro-cli runtimes were killed).")
+    ui.detail(
+        "Any in-flight chats/cron sessions were stopped (their kiro-cli runtimes were killed)."
+    )
     ui.detail("Sign in with another account: kirocrew cloud login")
     return 0
 
@@ -410,10 +412,16 @@ def _cloud_destroy(args: argparse.Namespace) -> int:
             ui.detail(f"Remove it manually: aws s3 rm {src['uri']}")
         if src.get("error"):
             ui.detail(src["error"])
-    cfg = CloudConfig.load()
-    if cfg.last_tag == tag:
-        cfg.last_tag = ""
-        cfg.save()
+    # Through `apply_update`, not load-mutate-save: this runs AFTER the stack is gone, so a
+    # stale-write refusal here would escape into a command whose remote work is already done,
+    # and writing the whole record back would erase an edit that landed during the delete.
+    # Only `last_tag` is this command's to clear.
+    #
+    # The PRECONDITION travels with the write rather than being checked here: read outside
+    # the lock, a launch recording its own tag between the read and the clear would have its
+    # pointer wiped by this command. `expect` re-checks it against the locked value, and
+    # declines rather than raising when the locked value differs.
+    CloudConfig.apply_update(expect_last_tag=tag, last_tag="")
 
     ui.ok(f"Removed '{tag}' — all AWS resources deleted. You won't be billed for it.")
     return 0

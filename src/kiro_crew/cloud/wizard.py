@@ -545,8 +545,13 @@ def launch(
             return 1
         # Deploy succeeded (WaitCondition confirmed the gateway healthy) — NOW it
         # is safe to persist the tag as the saved deployment.
+        #
+        # Re-reads and updates only these three fields rather than writing `cfg` back.
+        # `cfg` was read before the wizard's questions and the deploy, so it can be
+        # minutes stale, and writing it whole would erase a `fargate` block edited in
+        # that window. This path does not own that block and must not touch it.
         cfg.profile, cfg.region, cfg.last_tag = profile, region, tag
-        cfg.save()
+        CloudConfig.apply_update(profile=profile, region=region, last_tag=tag)
         ui.ok(f"Instance {result.instance_id} is up and KiroCrew is healthy.")
     elif not result.instance_id:
         ui.warn("Previous cloud stack exists but the instance is not ready yet.")
@@ -761,7 +766,11 @@ def _select_existing_launch(
         return None
     cfg.profile, cfg.region, cfg.last_tag = profile, region, selected.tag
     if not selected.saved:
-        cfg.save()
+        # Through `apply_update`, not `cfg.save()`: this snapshot was read before the
+        # resume prompts, so saving the whole record back erases anything an operator
+        # edited meanwhile, and once `save()` refuses instead, the refusal escapes into a
+        # command that has already done its remote work. Only these three fields are ours.
+        CloudConfig.apply_update(profile=profile, region=region, last_tag=selected.tag)
     return result
 
 

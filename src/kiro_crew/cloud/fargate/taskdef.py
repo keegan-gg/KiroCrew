@@ -205,15 +205,21 @@ class TaskDefinitionSpec:
     log: LogSpec
 
 
-def secret_destinations(spec: TaskDefinitionSpec) -> dict[str, SecretRef]:
-    """Each container variable this spec delivers, mapped to the secret behind it.
+def secret_destinations_for(secrets: Sequence[SecretRef]) -> dict[str, SecretRef]:
+    """Each container variable *secrets* delivers, mapped to the secret behind it.
 
-    Refuses two references whose derived variable is the same. Two secrets
-    competing for one destination have no defined winner, and the container would
-    read whichever the document happened to list first.
+    Takes the REFERENCES rather than a whole spec, because that is all the rule needs. It
+    is split out so a caller holding only secrets -- the launcher's config gate, deciding
+    whether a saved block names the model credential -- can apply this exact rule instead
+    of approximating it. Approximating it is what registered a lane the engine then
+    refused, three separate times.
+
+    Refuses two references whose derived variable is the same. Two secrets competing for
+    one destination have no defined winner, and the container would read whichever the
+    document happened to list first.
     """
     destinations: dict[str, SecretRef] = {}
-    for ref in spec.secrets:
+    for ref in secrets:
         name = secret_env_name(ref, source="secrets[].valueFrom")
         if name in destinations:
             raise DocumentRefused(
@@ -223,6 +229,15 @@ def secret_destinations(spec: TaskDefinitionSpec) -> dict[str, SecretRef]:
             )
         destinations[name] = ref
     return destinations
+
+
+def secret_destinations(spec: TaskDefinitionSpec) -> dict[str, SecretRef]:
+    """Each container variable this spec delivers, mapped to the secret behind it.
+
+    The spec-shaped spelling of :func:`secret_destinations_for`, kept because every
+    engine-side caller has a spec in hand. It DELEGATES rather than repeating the rule.
+    """
+    return secret_destinations_for(spec.secrets)
 
 
 def spec_binding(spec: TaskDefinitionSpec) -> CrewBinding:

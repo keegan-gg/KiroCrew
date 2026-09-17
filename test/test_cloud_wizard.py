@@ -109,7 +109,7 @@ class TestLaunchSubnetFlag:
         captured = {}
 
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.CloudConfig, "_replace_file", lambda self, *a, **k: None)
         monkeypatch.setattr(
             wizard.iam,
             "reachability_check",
@@ -154,7 +154,9 @@ class TestLaunchResume:
 
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
-            wizard.CloudConfig, "save", lambda self, *a: save_calls.append(self.last_tag)
+            wizard.CloudConfig,
+            "_replace_file",
+            lambda self, *a, **k: save_calls.append(self.last_tag),
         )
         monkeypatch.setattr(
             ec2,
@@ -200,7 +202,7 @@ class TestLaunchResume:
         cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch, logged_in=False)
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.CloudConfig, "_replace_file", lambda self, *a, **k: None)
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -253,7 +255,7 @@ class TestLaunchResume:
         cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch, logged_in=False)
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.CloudConfig, "_replace_file", lambda self, *a, **k: None)
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -299,7 +301,7 @@ class TestLaunchResume:
         cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch, logged_in=False)
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.CloudConfig, "_replace_file", lambda self, *a, **k: None)
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -350,7 +352,7 @@ class TestLaunchResume:
         cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
         calls = _patch_post_launch(monkeypatch, logged_in=False)
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.CloudConfig, "_replace_file", lambda self, *a, **k: None)
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -427,7 +429,7 @@ class TestLaunchResume:
         monkeypatch.setattr(ec2, "describe", fake_describe)
         monkeypatch.setattr(ec2, "list_stacks", lambda *_a, **_k: [])  # no other stacks
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.CloudConfig, "_replace_file", lambda self, *a, **k: None)
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-fresh")
         deployed: list[str] = []
 
@@ -454,7 +456,7 @@ class TestLaunchResume:
         cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
         _patch_post_launch(monkeypatch)
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.CloudConfig, "_replace_file", lambda self, *a, **k: None)
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -489,7 +491,7 @@ class TestLaunchResume:
         cfg = CloudConfig(profile="dev", region="us-west-2", last_tag="kc-old")
         _patch_post_launch(monkeypatch)
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.CloudConfig, "_replace_file", lambda self, *a, **k: None)
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -554,7 +556,7 @@ class TestLaunchResume:
 
         monkeypatch.setattr(connect_mod, "connect", fake_connect_with_proc)
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.CloudConfig, "_replace_file", lambda self, *a, **k: None)
         monkeypatch.setattr(
             ec2,
             "describe",
@@ -584,8 +586,8 @@ class TestLaunchResume:
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
             wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            "_replace_file",
+            lambda self, *a, **k: save_calls.append((self.profile, self.region, self.last_tag)),
         )
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
         monkeypatch.setattr(ec2, "describe", lambda *_a, **_k: {"exists": False})
@@ -616,7 +618,7 @@ class TestLaunchResume:
         deploy_calls: list[str] = []
 
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
-        monkeypatch.setattr(wizard.CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(wizard.CloudConfig, "_replace_file", lambda self, *a, **k: None)
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
         monkeypatch.setattr(
             ec2,
@@ -655,8 +657,8 @@ class TestLaunchResume:
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
             wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            "_replace_file",
+            lambda self, *a, **k: save_calls.append((self.profile, self.region, self.last_tag)),
         )
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
         monkeypatch.setattr(ec2, "list_stacks", lambda *_a, **_k: [])
@@ -677,8 +679,8 @@ class TestLaunchResume:
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
             wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            "_replace_file",
+            lambda self, *a, **k: save_calls.append((self.profile, self.region, self.last_tag)),
         )
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
         monkeypatch.setattr(ec2, "list_stacks", lambda *_a, **_k: [])
@@ -705,8 +707,8 @@ class TestLaunchResume:
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
             wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            "_replace_file",
+            lambda self, *a, **k: save_calls.append((self.profile, self.region, self.last_tag)),
         )
         monkeypatch.setattr(
             ec2,
@@ -754,8 +756,8 @@ class TestLaunchResume:
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
             wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            "_replace_file",
+            lambda self, *a, **k: save_calls.append((self.profile, self.region, self.last_tag)),
         )
         monkeypatch.setattr(wizard, "_new_tag", lambda: "kc-new")
         monkeypatch.setattr(
@@ -808,8 +810,8 @@ class TestLaunchResume:
         monkeypatch.setattr(wizard.CloudConfig, "load", classmethod(lambda cls, *a: cfg))
         monkeypatch.setattr(
             wizard.CloudConfig,
-            "save",
-            lambda self, *a: save_calls.append((self.profile, self.region, self.last_tag)),
+            "_replace_file",
+            lambda self, *a, **k: save_calls.append((self.profile, self.region, self.last_tag)),
         )
         monkeypatch.setattr(
             ec2,
@@ -1005,7 +1007,7 @@ class TestSizeKeyGuard:
         _patch_post_launch(monkeypatch)
         monkeypatch.setattr(wizard.ec2, "find_stack", lambda *a, **k: None)
         monkeypatch.setattr(CloudConfig, "load", classmethod(lambda cls, *a: CloudConfig()))
-        monkeypatch.setattr(CloudConfig, "save", lambda self, *a: None)
+        monkeypatch.setattr(CloudConfig, "_replace_file", lambda self, *a, **k: None)
         rc = wizard.launch(
             profile="dev", region="us-east-1", size_key="ginormous", assume_yes=True, force_new=True
         )

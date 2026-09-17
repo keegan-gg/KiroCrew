@@ -491,7 +491,12 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
         # cannot back must not leave a PENDING job file that a restart then reaps
         # as "interrupted" for a launch that never started.
         try:
-            engine = _engine(state, provider_id)
+            # Off the loop like every other disk-touching call in this handler. The
+            # built-in id resolves without reading anything, but the Fargate id reads
+            # cloud.json through the seam, and a slow disk on that read would stall
+            # the gateway's other requests and its heartbeat behind it -- the reason
+            # the store calls above are wrapped.
+            engine = await _in_executor(functools.partial(_engine, state, provider_id))
         except KeyError:
             _audit("launch_create", "denied", error=f"no engine for {provider_id!r}")
             return web.json_response(

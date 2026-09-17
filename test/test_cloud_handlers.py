@@ -805,6 +805,25 @@ def _compose(monkeypatch, provider):
 
 @pytest.mark.asyncio
 class TestProvisionerSeam:
+    def test_the_engine_is_resolved_off_the_event_loop(self):
+        """Resolving an engine now touches the disk, so it must not run on the loop.
+
+        The seam reads ``cloud.json`` to decide whether the Fargate lane exists, and
+        this handler's sibling store calls are already wrapped for exactly this
+        reason -- one says so in a comment: a slow disk would stall the gateway's
+        other requests and its heartbeat behind it. An unwrapped resolve beside
+        wrapped calls is also the inconsistency a later reader re-litigates, so the
+        property is pinned rather than left to a comment.
+
+        Asserted on the source because the cost is a blocking syscall inside a
+        coroutine: a behavioural test would have to make the disk slow to see it,
+        and this class is pinned the same way elsewhere in the suite.
+        """
+        import inspect
+
+        src = inspect.getsource(hc.api_cloud_launch_create)
+        assert "_in_executor(functools.partial(_engine" in src
+
     async def test_stock_listing_is_the_builtin_lane(self, tmp_path):
         """No composition: exactly the EC2 descriptor, drawn by the core's own form."""
         resp = await hc.api_cloud_provisioners(
