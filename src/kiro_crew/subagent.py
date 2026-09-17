@@ -514,6 +514,10 @@ _RECOVERY_SLOT_WAIT_SECS = 60.0
 _REPORT_DRAIN_TIMEOUT = (
     30.0  # max seconds cancel_all() waits for shielded terminal reports to drain
 )
+# Bound boundary-scoped report failures after their terminal tasks disappear.
+_REPORT_FAILURE_PARENT_CAP = 500
+_REPORT_FAILURES_PER_PARENT_CAP = 64
+_REPORT_FAILURE_OVERFLOW_KEY = ("", "")
 # Max seconds a cancelled run holds cancellation open for an in-flight off-loop
 # state.json write worker -- every off-loop writer: long enough for any healthy
 # fsync, short enough that a wedged FS
@@ -1217,6 +1221,12 @@ _SYSTEM_PREFIX = (
 )
 
 
+def stage_boundary_owner_for_run(info: object) -> str:
+    """Return a run's captured owner token; a missing token is unowned."""
+    owner = getattr(info, "_stage_boundary_owner", "")
+    return owner if isinstance(owner, str) else ""
+
+
 @dataclass
 class SubagentInfo:
     """Metadata for a running subagent."""
@@ -1247,6 +1257,8 @@ class SubagentInfo:
     # record, and the handler answers 429 from that absence.
     error_code: str = ""
     parent_session_key: str = ""
+    # Boundary owner captured at admission; empty means explicitly unowned.
+    _stage_boundary_owner: str = field(default="", repr=False)
     memory_mode: str = field(default="persistent", kw_only=True)
     _memory_mode_ready: bool = field(default=True, init=False, repr=False)
     agent: str = ""
@@ -1634,6 +1646,10 @@ def _context_groups_field(info: "SubagentInfo") -> str:
     return ",".join(sorted(_context_groups_of(info)))
 
 
+class SubagentReportDeliveryError(RuntimeError):
+    """One or more registered terminal reports failed before delivery."""
+
+
 class ToolApprovalCallback(Protocol):
     async def __call__(self, event: LLMEvent, parent_session_key: str = "") -> bool:
         pass
@@ -1772,6 +1788,9 @@ class SubagentManager:
         self._followup_watchers: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         # task -> the agent whose terminal report it is delivering
         self._report_owners: dict[asyncio.Task, SubagentInfo] = {}  # type: ignore[type-arg]
+        # Boundary-scoped failures outlive completed report tasks. The overflow
+        # key fails the next owned boundary closed when the cap loses identity.
+        self._report_failures: dict[tuple[str, str], int] = {}
         self._last_spawn_ts: float = 0.0  # monotonic time of the last actual start (stagger gate)
         self.hook_store: Any = None  # Optional ScriptHookStore, set by server.py
         self._agents: dict[str, SubagentInfo] = {}
@@ -2357,7 +2376,7 @@ class SubagentManager:
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-    ) -> None:
+    ) -> bool:
         return await self._terminal._report_terminal_impl(
             info,
             source=source,
@@ -2376,7 +2395,7 @@ class SubagentManager:
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-    ) -> None:
+    ) -> bool:
         return await self._terminal._run_terminal_report_impl(
             info,
             source=source,
@@ -2395,7 +2414,7 @@ class SubagentManager:
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-    ) -> "asyncio.Task":  # type: ignore[type-arg]
+    ) -> "asyncio.Task[bool]":
         return self._terminal._spawn_terminal_report_impl(
             info,
             source=source,
@@ -2406,7 +2425,7 @@ class SubagentManager:
         )
 
     @staticmethod
-    async def _await_report(task: "asyncio.Task") -> None:  # type: ignore[type-arg]
+    async def _await_report(task: "asyncio.Task[bool]") -> bool:
         """Block until a spawned terminal report completes, shielded.
 
         On normal completion this blocks until the report is delivered
@@ -2415,7 +2434,82 @@ class SubagentManager:
         still receives ``CancelledError`` — teardown semantics are unchanged and
         the outcome is never stranded.
         """
-        await asyncio.shield(task)
+        return await asyncio.shield(task)
+
+    def _latch_report_failure(self, info: object) -> None:
+        """Retain one boundary-owned failure in a fully bounded latch."""
+        owner = stage_boundary_owner_for_run(info)
+        parent = getattr(info, "parent_session_key", "")
+        if not owner or not isinstance(parent, str) or not parent:
+            return
+
+        failures = self._report_failures
+        limit = _REPORT_FAILURES_PER_PARENT_CAP + 1
+        key = (parent, owner)
+        if key not in failures and len(failures) >= _REPORT_FAILURE_PARENT_CAP:
+            key = _REPORT_FAILURE_OVERFLOW_KEY
+            if key not in failures:
+                evicted = failures.pop(next(iter(failures)))
+                failures[key] = min(evicted, limit)
+        failures[key] = min(failures.get(key, 0) + 1, limit)
+
+    def _take_report_failures(self, parent: str, owner: str) -> int:
+        """Consume this boundary's failures plus any identity-lost overflow."""
+        if not owner:
+            return 0
+        failures = self._report_failures
+        exact = failures.pop((parent, owner), 0)
+        overflow = failures.pop(_REPORT_FAILURE_OVERFLOW_KEY, 0)
+        return min(exact + overflow, _REPORT_FAILURES_PER_PARENT_CAP + 1)
+
+    async def wait_for_parent_reports(
+        self,
+        parent_session_key: str,
+        boundary_owner: str = "",
+    ) -> bool:
+        """Wait until this boundary's registered terminal reports finish.
+
+        Active tasks live in ``_report_owners``; completed failures remain in
+        ``_report_failures`` until the matching owner consumes them.
+        """
+        observed = False
+        while True:
+            failed = self._take_report_failures(parent_session_key, boundary_owner)
+            if failed:
+                raise SubagentReportDeliveryError(
+                    f"{failed} registered terminal report task(s) failed"
+                )
+            reports = tuple(
+                task
+                for task, owner in self._report_owners.items()
+                if owner.parent_session_key == parent_session_key
+                and stage_boundary_owner_for_run(owner) == boundary_owner
+            )
+            if not reports:
+                return observed
+            observed = True
+            outcomes = await asyncio.gather(
+                *(asyncio.shield(task) for task in reports),
+                return_exceptions=True,
+            )
+            # The normal done callback removes every owner and latches failures.
+            # Focused tests and shutdown races may leave a completed entry here;
+            # consume it explicitly so the barrier cannot observe it twice.
+            for task in reports:
+                if task.done():
+                    self._report_owners.pop(task, None)
+            outcome_failures = sum(
+                isinstance(outcome, BaseException) or outcome is False for outcome in outcomes
+            )
+            latched_failures = self._take_report_failures(
+                parent_session_key,
+                boundary_owner,
+            )
+            failed = max(outcome_failures, latched_failures)
+            if failed:
+                raise SubagentReportDeliveryError(
+                    f"{failed} registered terminal report task(s) failed"
+                )
 
     def _release_slot(self, info: SubagentInfo) -> bool:
         return self._terminal._release_slot_impl(info)
@@ -2585,6 +2679,7 @@ class SubagentManager:
         _child_registration: bool = True,
         *,
         crew: str = "",
+        _stage_boundary_owner: str = "",
     ) -> SubagentInfo | None:
         result = self._admission.spawn_impl(
             task,
@@ -2617,8 +2712,13 @@ class SubagentManager:
             _window_hint=_window_hint,
             _child_registration=_child_registration,
             crew=crew,
+            _stage_boundary_owner=_stage_boundary_owner,
         )
         assert not isinstance(result, PreparedSpawn)
+        # Every synchronous gate return (started, queued, or refused) receives
+        # the same admission snapshot before a scheduled announce can run.
+        if isinstance(result, SubagentInfo):
+            result._stage_boundary_owner = _stage_boundary_owner
         # ``ClaimPoint`` comes back ONLY for ``_stop_before_claim=True``, whose
         # sole caller is the coroutine pump's ``_dispatch_async``; every other
         # caller receives a ``SubagentInfo`` or None as declared.
@@ -2633,6 +2733,8 @@ class SubagentManager:
         kwargs.pop("_store_accepted", None)
         prepared = self._admission.spawn_impl(task, _prepare_only=True, **kwargs)
         assert not isinstance(prepared, ClaimPoint)  # never requested here
+        if isinstance(prepared, SubagentInfo):
+            prepared._stage_boundary_owner = str(kwargs.get("_stage_boundary_owner") or "")
         return prepared
 
     async def spawn_async(self, task: str, **kwargs: Any) -> SubagentInfo | None:
@@ -2685,6 +2787,7 @@ class SubagentManager:
                     task=redact_credentials(redact_exfiltration_urls(task)[0])[0],
                     agent=str(kwargs.get("agent") or ""),
                     parent_session_key=str(kwargs.get("parent_session_key") or ""),
+                    _stage_boundary_owner=str(kwargs.get("_stage_boundary_owner") or ""),
                     done=True,
                     error=f"spawn refused: task store unavailable ({store_err})",
                     error_code=self._admission.TASK_STORE_UNAVAILABLE_CODE,
@@ -2764,6 +2867,7 @@ class SubagentManager:
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _stage_boundary_owner: str = "",
     ) -> SubagentInfo | None:
         return self._continuation.continue_conversation_impl(
             conv_id,
@@ -2775,6 +2879,7 @@ class SubagentManager:
             cwd,
             _preassigned_id,
             _memory_mode=_memory_mode,
+            _stage_boundary_owner=_stage_boundary_owner,
         )
 
     async def continue_conversation_async(
@@ -2788,6 +2893,7 @@ class SubagentManager:
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _stage_boundary_owner: str = "",
     ) -> SubagentInfo | None:
         return await self._continuation.continue_conversation_async_impl(
             conv_id,
@@ -2798,7 +2904,8 @@ class SubagentManager:
             max_turns,
             cwd,
             _preassigned_id,
-            _memory_mode,
+            _memory_mode=_memory_mode,
+            _stage_boundary_owner=_stage_boundary_owner,
         )
 
     def _continue_prelude(
@@ -2812,6 +2919,7 @@ class SubagentManager:
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _stage_boundary_owner: str = "",
     ) -> "SubagentInfo | dict[str, Any] | None":
         return self._continuation._continue_prelude_impl(
             conv_id,
@@ -2823,6 +2931,7 @@ class SubagentManager:
             cwd,
             _preassigned_id,
             _memory_mode,
+            _stage_boundary_owner,
         )
 
     def recorded_cwd(self, conv_id: str) -> str:

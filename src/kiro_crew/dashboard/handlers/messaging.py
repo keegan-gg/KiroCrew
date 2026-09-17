@@ -68,6 +68,7 @@ from kiro_crew.dashboard.state import (
     CRON_NOTIFY_END,
     CRON_NOTIFY_PREFIX,
     DashboardState,
+    stage_boundary_for,
 )
 from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot
 from kiro_crew.messaging.display_safety import redact_for_display
@@ -89,7 +90,11 @@ from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exf
 from kiro_crew.slack.format import build_options_blocks, extract_options
 from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
 from kiro_crew.spawn_warm import warm_project_agents_for_spawn
-from kiro_crew.subagent import effort_applied_note, effort_drop_reason
+from kiro_crew.subagent import (
+    effort_applied_note,
+    effort_drop_reason,
+    stage_boundary_owner_for_run,
+)
 from kiro_crew.subagent_persistence import _agent_dir, read_state
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
@@ -219,6 +224,17 @@ async def _spawn_request_memory_mode(
         parent_mode if caller == parent else await resolve_session_memory_mode(state, caller)
     )
     return strictest((parent_mode, caller_mode)) or "persistent"
+
+
+def _stage_boundary_owner_for_parent(state: DashboardState, parent: str) -> str:
+    """Return the active stage token for *parent*, or explicit unowned ``""``."""
+    slot_name = dashboard_slot_key(parent)
+    if not slot_name and parent.startswith("dashboard:"):
+        slot_name = parent.removeprefix("dashboard:")
+    slots = getattr(state, "_slots", None)
+    slot = slots.get(slot_name) if isinstance(slots, dict) and slot_name else None
+    owner = stage_boundary_for(slot).owner
+    return owner if isinstance(owner, str) else ""
 
 
 async def api_spawn(request: web.Request) -> web.Response:
@@ -428,6 +444,7 @@ async def api_spawn(request: web.Request) -> web.Response:
         memory_store=child_memory_store,
         crew=crew,
         _memory_mode=admitted_mode,
+        _stage_boundary_owner=_stage_boundary_owner_for_parent(state, parent_session),
     )
     if not info:
         # Reached mgr.spawn (submission COUNTED at the top of spawn()) but
@@ -620,6 +637,7 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
         max_turns=max_turns,
         cwd=resumed_cwd,
         _memory_mode=admitted_mode,
+        _stage_boundary_owner=_stage_boundary_owner_for_parent(state, parent_session),
     )
     if not info:
         return web.json_response(
@@ -1090,6 +1108,7 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         # it" -- and a retry is exactly when nobody re-reads the scope.
         memory_store=old.memory_store,
         crew=old.crew,
+        _stage_boundary_owner=stage_boundary_owner_for_run(old),
     )
     if not info:
         return web.json_response(

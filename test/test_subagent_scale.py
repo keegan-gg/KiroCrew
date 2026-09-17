@@ -2343,6 +2343,23 @@ class TestRetryGating:
         assert mgr.spawn.call_args.args[0] == "original raw task"
         assert mgr.spawn.call_args.kwargs["parent_session_key"] == "dashboard:m"
 
+    @pytest.mark.asyncio
+    async def test_retry_inherits_original_stage_boundary_owner(self):
+        """Retry ownership follows the failed work, not the retry click time."""
+        from kiro_crew.dashboard.handlers.messaging import api_spawn_retry
+
+        failed = SubagentInfo(id="f1", task="failed", parent_session_key="dashboard:m")
+        failed.done = True
+        failed.error = "boom"
+        failed._stage_boundary_owner = "stage-owner"
+        mgr = self._mgr_with(failed)
+        mgr.spawn = MagicMock(return_value=SubagentInfo(id="n1", task="failed"))
+
+        resp = await api_spawn_retry(self._request(mgr, "f1"))
+
+        assert resp.status == 200
+        assert mgr.spawn.call_args.kwargs["_stage_boundary_owner"] == "stage-owner"
+
 
 # ── 6. Durable task queue at scale ───────────────────────────────────
 

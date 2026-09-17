@@ -127,6 +127,37 @@ async def test_double_cancel_appends_exactly_one_cancelled_row(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_idle_cancel_settles_owned_stage_delivery_debt(tmp_path):
+    """A paused boundary releases its queue row and retention debt on Cancel."""
+    from kiro_crew.dashboard.chat_utils import SUBAGENT_COMPLETION_KIND
+
+    state, slot = _make_orchestrator_state(tmp_path, "cancel-idle-debt", ["First"])
+    settled: list[list[str]] = []
+
+    async def _settle(agent_ids: list[str]) -> None:
+        settled.append(agent_ids)
+
+    state.subagents.settle_queued_delivery = _settle
+    slot.stage_boundary.arm(1, consumed=True)
+    announce = "[Subagent completion event]\nstage-owned result"
+    slot.queue_append(
+        announce,
+        kind=SUBAGENT_COMPLETION_KIND,
+        meta=slot.stage_boundary.tag_meta(),
+    )
+    slot.note_pending_subagent_delivery(announce, ["stage-agent"])
+    assert slot._stage_controller_task is None and not slot._in_stage_execution
+
+    async with TestClient(TestServer(_make_app(state))) as client:
+        await _cancel(client, slot.key)
+
+    assert slot._queue == [], "idle Cancel left the stage-owned completion queued"
+    assert slot._subagent_delivery_pending == {}, "idle Cancel stranded delivery debt"
+    assert settled == [["stage-agent"]]
+    assert slot.stage_boundary.stage is None
+
+
+@pytest.mark.asyncio
 async def test_new_plan_clears_cancel_latch_and_runs(tmp_path, monkeypatch):
     """Arming a NEW plan clears the latch; the fresh plan runs normally."""
     from kiro_crew.dashboard.chat import _stage_loop
@@ -279,6 +310,63 @@ async def test_mid_loop_cancel_drops_queued_approval_at_finally_drain(tmp_path, 
         f"is a plain message and hands off first: {handed_off}"
     )
     assert [e["content"] for e in slot._queue] == ["real message during plan"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_plan_delivers_unrelated_completion(tmp_path, monkeypatch):
+    """Cancel drops only this plan's work, not an earlier agent's result."""
+    from kiro_crew.dashboard.chat import _stage_loop
+    from kiro_crew.dashboard.chat_utils import SUBAGENT_COMPLETION_KIND
+
+    state, slot = _make_orchestrator_state(tmp_path, "cancel-unrelated-result", ["First"])
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    handed_off: list[dict] = []
+    unrelated = "[Subagent completion event]\nresult from an earlier turn"
+    owned = "[Subagent completion event]\nresult from this stage"
+
+    async def _mock_run_chat(_state, _slot, _message, **_kwargs):
+        entered.set()
+        await release.wait()
+
+    async def _mock_start_next_queued_turn(_state, _slot):
+        handed_off.append(_slot.queue_pop(0))
+        return True
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _mock_run_chat)
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.chat_orchestrator._start_next_queued_turn",
+        _mock_start_next_queued_turn,
+    )
+
+    async with TestClient(TestServer(_make_app(state))) as client:
+        loop_task = asyncio.create_task(_stage_loop(state, slot, auto_run=True))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            # This agent started before the plan. Its completion happens to land
+            # while Autopilot is active, but the cancelled plan does not own it.
+            owner = slot.stage_boundary.owner
+            assert owner is not None
+            slot.queue_append(
+                unrelated,
+                kind=SUBAGENT_COMPLETION_KIND,
+                meta=slot.stage_boundary.tag_captured_meta({}, ""),
+            )
+            slot.queue_append(
+                owned,
+                kind=SUBAGENT_COMPLETION_KIND,
+                meta=slot.stage_boundary.tag_captured_meta({}, owner),
+            )
+            await _cancel(client, slot.key)
+        finally:
+            release.set()
+        await asyncio.wait_for(loop_task, timeout=5)
+
+    assert [entry["content"] for entry in handed_off] == [unrelated], (
+        "plan cancellation discarded an unrelated agent completion instead of "
+        "delivering it as the next ordinary queued turn"
+    )
+    assert slot._queue == [], "the cancelled stage's owned completion survived cancellation"
 
 
 def test_is_plan_approval_entry_matches_tag_only():

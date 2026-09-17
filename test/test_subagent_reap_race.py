@@ -392,6 +392,69 @@ async def test_run_path_claim_still_withheld_during_recovering():
     assert info._recovering is True, "the non-terminal path must not clear it"
 
 
+# ── terminal report outcomes must reach parent settlement ────────────
+
+
+@pytest.mark.asyncio
+async def test_terminal_report_failure_reaches_parent_barrier():
+    """A handled announce failure is still a failed boundary-owned delivery."""
+    from kiro_crew.subagent import SubagentReportDeliveryError
+
+    mgr = _make_manager()
+    owner = "stage-owner"
+    info = _info(parent_session_key="dashboard:parent", _stage_boundary_owner=owner)
+    mgr._on_done = AsyncMock(side_effect=RuntimeError("parent delivery failed"))
+    await mgr._spawn_terminal_report(
+        info,
+        source="test",
+        injection_timeout_reason="delivery failed",
+        mark_delivered_on_success=False,
+    )
+    with pytest.raises(SubagentReportDeliveryError):
+        await mgr.wait_for_parent_reports(info.parent_session_key, owner)
+
+
+@pytest.mark.asyncio
+async def test_unrelated_unowned_report_failure_neither_halts_nor_advances_stage():
+    """An ordinary report cannot poison or bypass a later stage barrier."""
+    mgr = _make_manager()
+    parent, owner = "dashboard:parent", "later-stage-owner"
+    mgr._latch_report_failure(_info(parent_session_key=parent))
+    assert mgr._report_failures == {}
+
+    release = asyncio.Event()
+    report = asyncio.create_task(release.wait())
+    mgr._report_owners[report] = _info(
+        parent_session_key=parent, _stage_boundary_owner=owner
+    )
+    waiter = asyncio.create_task(mgr.wait_for_parent_reports(parent, owner))
+    await asyncio.sleep(0)
+    assert not waiter.done(), "unrelated failure halted or advanced the owned barrier"
+    release.set()
+    assert await waiter is True
+
+
+def test_report_failure_latch_bounds_parents_and_per_parent_overflow(monkeypatch):
+    """Every retained failure field stays bounded without becoming success."""
+    import kiro_crew.subagent as mod
+
+    monkeypatch.setattr(mod, "_REPORT_FAILURE_PARENT_CAP", 2)
+    monkeypatch.setattr(mod, "_REPORT_FAILURES_PER_PARENT_CAP", 2)
+    mgr = _make_manager()
+    for _ in range(5):
+        mgr._latch_report_failure(
+            _info(parent_session_key="first", _stage_boundary_owner="first")
+        )
+    for key in ("second", "overflow"):
+        mgr._latch_report_failure(
+            _info(parent_session_key=key, _stage_boundary_owner=key)
+        )
+
+    assert len(mgr._report_failures) == 2
+    assert all(count <= 3 for count in mgr._report_failures.values())
+    assert mgr._take_report_failures("overflow", "overflow") == 3
+
+
 # ── the shutdown drain must not abandon stragglers ───────────────────
 
 

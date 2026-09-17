@@ -297,6 +297,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _stage_boundary_owner: str = "",
     ) -> SubagentInfo | None:
         """Dispatch a follow-up *task* into conversation *conv_id* (sync callers).
 
@@ -327,6 +328,7 @@ class ContinuationCoordinator(ManagerComponent):
             cwd,
             _preassigned_id,
             _memory_mode,
+            _stage_boundary_owner,
         )
         if not isinstance(prelude, dict):
             return prelude
@@ -343,6 +345,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _stage_boundary_owner: str = "",
     ) -> SubagentInfo | None:
         """:meth:`continue_conversation_impl` for event-loop callers: the same
         prelude, then ``spawn_async`` (write-before-ack with the store write on
@@ -357,6 +360,7 @@ class ContinuationCoordinator(ManagerComponent):
             cwd,
             _preassigned_id,
             _memory_mode,
+            _stage_boundary_owner,
         )
         if not isinstance(prelude, dict):
             return prelude
@@ -373,6 +377,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _stage_boundary_owner: str = "",
     ) -> "SubagentInfo | dict[str, Any] | None":
         """Dispatch a follow-up *task* into conversation *conv_id*.
 
@@ -559,6 +564,7 @@ class ContinuationCoordinator(ManagerComponent):
             # follow-up reads the global store -- a split nothing reports.
             memory_store=memory_store,
             _memory_mode=_memory_mode,
+            _stage_boundary_owner=_stage_boundary_owner,
             app=app,
         )
 

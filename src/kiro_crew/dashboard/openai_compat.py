@@ -27,7 +27,7 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.context import _neutralize_structural_markers
 from kiro_crew.dashboard.chat_runner import _run_chat
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
-from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key
+from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key, stage_boundary_for
 from kiro_crew.dashboard.turn_dispatch import chat_turn_timeout_secs
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -348,8 +348,14 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                 },
                 status=409,
             )
-        # Busy check — prevent concurrent writes to same slot
-        if slot.task is not None and not slot.task.done():
+        # Busy check — prevent concurrent writes to the same slot. ``running``
+        # includes the outer Autopilot controller while no child turn occupies
+        # ``slot.task``; the pending marker keeps the same isolation after an
+        # authentication pause has ended that controller but before Stage N is
+        # settled and captured.
+        if slot.running is True or (
+            stage_boundary_for(slot).stage is not None and not slot._plan_cancelled
+        ):
             sel().log_api_access(
                 caller=request.remote or "",
                 operation="openai_compat.chat",
@@ -359,7 +365,14 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                 error="slot busy",
             )
             return web.json_response(
-                {"error": {"message": f"slot {slot_id!r} is busy", "type": "slot_busy"}},
+                {
+                    "error": {
+                        "message": f"slot {slot_id!r} is busy",
+                        "type": "slot_busy",
+                        "code": "slot_busy",
+                    },
+                    "code": "slot_busy",
+                },
                 status=409,
             )
         # Member DM threads are pinned to their crew — the specific refusal
