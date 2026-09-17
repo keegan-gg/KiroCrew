@@ -83,8 +83,6 @@ def test_rewrite_agents_signature_is_pinned_to_fingerprint_inputs() -> None:
 #   * STALE only          -> the read is gone; prune the entry.
 _AMBIENT_READ_ALLOWLIST = frozenset(
     {
-        # Baked into every overlay ``command``; fingerprinted as "python".
-        ("_build_stub_entry", "sys.executable"),
         # The fingerprint builder reading its own declared inputs.
         ("_rewrite_inputs_fingerprint", "os.environ:PATH"),
         ("_rewrite_inputs_fingerprint", "os.environ:PATHEXT"),

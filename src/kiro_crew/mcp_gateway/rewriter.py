@@ -604,10 +604,13 @@ def _build_stub_entry(
         if k not in ("command", "args", "env", "poolable", "autoApprove",
                      _WRAPPER_MARKER, _WRAPPER_MARKER_LEGACY)
     }
+    stub_argv = platform_compat.isolated_python_argv(
+        "-m", _STUB_MODULE, f"{STUB_FLAGS_FLAG}={encode_target_args(stub_args)}"
+    )
     wrapped.update({
         _WRAPPER_MARKER: True,
-        "command": sys.executable,
-        # ``-m kiro_crew.mcp_gateway.stub`` leads; the stub's own flags follow
+        "command": stub_argv[0],
+        # ``-s -m kiro_crew.mcp_gateway.stub`` leads; the stub's own flags follow
         # as ONE encoded envelope. Every value above is raw operator or
         # filesystem text -- the executable path, the work dir, the socket, the
         # sidecar path, the server and agent names, the autoApprove
@@ -627,7 +630,7 @@ def _build_stub_entry(
         # session-agnostic, so it is appended per session by
         # ``session_servers.pooled_session_servers`` at ACP injection time,
         # where the value is in scope.
-        "args": ["-m", _STUB_MODULE, f"{STUB_FLAGS_FLAG}={encode_target_args(stub_args)}"],
+        "args": stub_argv[1:],
         # autoApprove must stay on the wrapper — kiro-cli reads it at the
         # permission-prompt UI layer, separately from the backend.
         "autoApprove": auto_approve,

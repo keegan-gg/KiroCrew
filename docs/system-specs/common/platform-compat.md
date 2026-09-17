@@ -46,6 +46,7 @@ produces exactly those silent failures, which is why the helper is named per cal
 | Wait on a subprocess PIPE with a deadline | a daemon reader thread feeding a `queue.Queue`, consumed with a bounded `get` (`testing/harness.py`'s `_StdoutPump`) | `selectors.DefaultSelector()` on the pipe (select()-based on Windows, which accepts SOCKETS only, so registering a pipe RAISES there) |
 | Re-enter an edition's stable gateway launcher | `reexec_launcher(launcher, args)` after `gateway_restart.resolve_restart_launcher()` validates it; keeps the dispatch pathname, original arguments and UTF-8 environment | resolving the symlink basename away, passing Python `-m` flags to a launcher, or evaluating a shell command |
 | Re-exec the current Python module | `reexec_python_module(module, args)` | `os.execv(sys.executable, [sys.executable, ...])` (breaks when the Windows interpreter path contains spaces) |
+| Launch a Kiro Crew-owned Python child | `isolated_python_argv(*args, executable=...)`; it adds `-s` for the bundle and parents whose user site is already unavailable, unless the option prefix carries `-s` or stronger `-I` | a raw `[sys.executable, ...]`, or an ad hoc `PYTHONNOUSERSITE` env that another spawn path can omit |
 | Replace the current process with another program (a supervised service body) | spawn a child, record its pid + `process_start_time`, and `wait()` on it under `IS_WINDOWS` (see `pod.windows.supervise_gateway`) | `os.execve` (on Windows this SPAWNS and terminates the caller, so the pid changes and the service manager sees the unit exit while the real program keeps running orphaned) |
 | Open an exact Windows process object for later tree discovery/termination | `open_process_termination_handle(pid, expected_token)` validates the opened handle's creation identity before returning it (caller closes with `close_process_handle`); combine with `descendant_termination_handles` so the anchored root and each retained child receive a final post-exit snapshot | opening by PID and checking the token beforehand (PID reuse can occur between those operations) |
 | Race-free Job object assignment | `creationflags \|= CREATE_SUSPENDED`, then `apply_job_limits`, then `resume_process_main_thread` | assigning a job to an already-running child (descendants it already spawned escape) |
@@ -66,6 +67,29 @@ produces exactly those silent failures, which is why the helper is named per cal
 | Spawn a system tool (`ps`, `lsof`, `netstat`, `taskkill`) | `trusted_system_bin(name)`, treating `None` as "unavailable" | a bare argv name (resolved through a `PATH` that can lead with same-uid-writable dirs) |
 | Read a Windows system tool's ANSWER (`schtasks /Query`, `tasklist`, `sc query`) | the tool's **exit code**, or a fact the program under test recorded itself | parsing its stdout (column headers AND status words are translated by the UI language, so a match on `"Running"` reports every instance down on a non-English host — the fail-OPEN direction) |
 | strftime no-pad | `strftime(dt, "%-I")` | bare `dt.strftime("%-I")` (`ValueError` on Windows) |
+
+## Internal Python child user-site isolation
+
+Every Kiro Crew-owned Python service, helper, and runtime dependency installer that
+can run under the bundled interpreter routes argv through `isolated_python_argv`.
+The helper adds `-s` for the bundle and for parents whose user site is already
+unavailable, removing the interpreter's user-site directory without dropping
+`PYTHONPATH`, cwd import behavior, or other required environment settings. A caller
+that already carries `-I` stays unchanged; `-I` is stronger because it also ignores
+Python environment variables and the cwd. A non-bundled parent that currently allows
+the user site preserves that policy because Kiro Crew itself may be installed there.
+
+A caller whose target remains importable without the user site MUST pass
+`force_isolation=True`. This applies when the caller supplies `PYTHONPATH`, sets cwd
+to the package root for an in-package module, or launches a Kiro Crew-owned helper by
+absolute path. The explicit override keeps `-s` on non-bundled, user-site-enabled
+interpreters without changing policy-dependent app and user workloads.
+
+This contract does not apply to user-authored cron scripts, project test commands, or
+other workloads whose documented environment may include `--user` packages. The
+explicit inventory in `test/test_internal_python_isolation.py` names the internal
+boundaries. Adding one requires routing it through the helper and adding it to that
+inventory, so a later spawn cannot silently return to the user-site-dependent behavior.
 
 ## Embedding threading and cancellation
 

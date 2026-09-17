@@ -1706,8 +1706,7 @@ def _provision_app_deps_locked(app_name: str, root: Path, pin: _PinnedDir) -> st
                 # reprovision on every start - a change confined to an
                 # included file cannot be masked.
                 pip_cmd, _ = wrap_argv(
-                    [
-                        sys.executable,
+                    platform_compat.isolated_python_argv(
                         "-m",
                         "pip",
                         "install",
@@ -1717,7 +1716,7 @@ def _provision_app_deps_locked(app_name: str, root: Path, pin: _PinnedDir) -> st
                         str(staging),
                         "-r",
                         str(req_src),
-                    ],
+                    ),
                     mode="standard",
                 )
                 pip_cmd = cgroup_scope_argv(pip_cmd)  # cgroup DoS ceiling
@@ -2292,32 +2291,24 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     # packages, with cwd at the kiro_crew source root so relative imports inside the
     # module work without venv setup.
     #
-    # The md-notebook spawn ALONE starts isolated (``-I``): a bare ``python -m`` runs the
-    # interpreter's startup hooks — ``sitecustomize`` / ``usercustomize`` / user-site
-    # ``.pth`` — and the default user site is an agent-writable, gateway-independent
-    # injection path a FRESH interpreter honours even though the running gateway never
-    # re-imports it. For md-notebook that startup code would run inside the one namespace
-    # where the PAT is unmasked, so the hooks must not ride along. Scoped to the spawn
-    # that carries the carve-out, not to every module builtin: the others have no
-    # unmasked secret in their namespace, and rewriting their import environment here
-    # would be a rider on a fix scoped to one.
+    # Every Kiro Crew-owned Python app backend starts with the user site disabled.
+    # ``-s`` is the shared minimum: it keeps the app's declared PYTHONPATH and cwd
+    # semantics while preventing ``~/.local`` packages from shadowing the runtime's
+    # pinned dependencies. md-notebook keeps its stronger ``-I`` contract because
+    # it also removes environment and cwd import sources before re-admitting the
+    # exact package root it needs.
     #
-    # ``-I`` also drops cwd-on-sys.path, the user site's PACKAGES, and ``PYTHONPATH`` (it
-    # implies ``-E``), so the import universe the module needs is restated EXPLICITLY:
-    # ``runpy`` (the machinery behind ``-m``) runs the module after inserting the root
-    # kiro_crew ITSELF was imported from — backend.py lives in that same package, so its
-    # own tree root IS that root. Correct across a venv install (site-packages, harmless
-    # duplicate), a --user install (the user-site dir re-admitted as a plain path entry
-    # WITHOUT its hooks — a plain sys.path insert never imports usercustomize and never
-    # processes ``.pth``), and a source tree (the repo ``src`` root). ``repr`` keeps both
-    # injected strings inert literals.
+    # ``-I`` drops cwd-on-sys.path and ``PYTHONPATH`` (it implies ``-E``), so the
+    # import universe md-notebook needs is restated EXPLICITLY: ``runpy`` (the
+    # machinery behind ``-m``) runs the module after inserting the root Kiro Crew
+    # itself was imported from. Correct across a venv install, a --user install,
+    # and a source tree; ``repr`` keeps both injected strings inert literals.
     elif entry is None:
         python_bin = sys.executable
         _import_root = str(Path(__file__).resolve().parent.parent.parent)
         cwd = _import_root
         if _shipped_md_notebook:
-            cmd = [
-                python_bin,
+            cmd = platform_compat.isolated_python_argv(
                 "-I",
                 "-c",
                 (
@@ -2325,9 +2316,15 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                     f"sys.path.insert(0, {_import_root!r}); "
                     f"runpy.run_module({entry_point!r}, run_name='__main__', alter_sys=True)"
                 ),
-            ]
+                executable=python_bin,
+            )
         else:
-            cmd = [python_bin, "-m", entry_point]
+            cmd = platform_compat.isolated_python_argv(
+                "-m",
+                entry_point,
+                executable=python_bin,
+                force_isolation=True,
+            )
 
     # --- Exec (shell-launcher) backend ---
     # Explicit `backend.type: "exec"` (exec the entry point file as-is — also
@@ -2381,20 +2378,30 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         else:
             cwd = str(root)
             module_path = ".".join(parts).removesuffix(".py")
-        cmd = [
-            python_bin, "-m", "uvicorn",
+        cmd = platform_compat.isolated_python_argv(
+            "-m",
+            "uvicorn",
             f"{module_path}:app",
-            "--host", "127.0.0.1",
-            "--port", str(port),
-            "--log-level", "warning",
-        ]
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--log-level",
+            "warning",
+            executable=python_bin,
+            force_isolation=bool(env.get("PYTHONPATH")),
+        )
 
     # --- Plain Python backend (default) ---
     else:
         # See the ASGI branch: venv python first, else the gateway's own interpreter —
         # one policy shared with the stdio MCP registration path.
         python_bin = resolve_app_python(root)
-        cmd = [python_bin, entry_str]
+        cmd = platform_compat.isolated_python_argv(
+            entry_str,
+            executable=python_bin,
+            force_isolation=bool(env.get("PYTHONPATH")),
+        )
         cwd = str(root)
 
     # Provisioned-deps launch shim: PYTHONPATH entries are not site dirs, so
@@ -2429,13 +2436,14 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
 
         _ti = _py_target_index(cmd[1:])
         if _ti is not None:
-            cmd = [
-                cmd[0],
+            cmd = platform_compat.isolated_python_argv(
                 *cmd[1 : 1 + _ti],
                 str(_deps_boot_path()),
                 str(_deps_dir),
                 *cmd[1 + _ti :],
-            ]
+                executable=cmd[0],
+                force_isolation=True,
+            )
     elif _deps_ready and cmd and os.path.isabs(cmd[0]) and _abi_shebang_of(root, cmd[0]):
         # An EXECUTABLE python script entry (cmd[0] is the script, not an
         # interpreter): the ABI check on the script path answers no-match,
@@ -2446,7 +2454,13 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         # shebangs (#!<python> -I keeps its kernel launch, flags intact)
         # and sensitive paths, so both contracts hold here by construction.
         _si = _abi_shebang_of(root, cmd[0])
-        cmd = [_si, str(_deps_boot_path()), str(_deps_dir), *cmd]
+        cmd = platform_compat.isolated_python_argv(
+            str(_deps_boot_path()),
+            str(_deps_dir),
+            *cmd,
+            executable=_si,
+            force_isolation=True,
+        )
     elif _deps_ready and path_command_is_abi_matched(root, cmd[0] if cmd else ""):
         # PYTHONPATH transport only on a POSITIVE ABI match: the deps tree
         # is built by the GATEWAY's pip, and an exec backend running a PATH
@@ -2456,6 +2470,11 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         _existing_pp = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = (
             f"{_deps_dir}{os.pathsep}{_existing_pp}" if _existing_pp else str(_deps_dir)
+        )
+        cmd = platform_compat.isolated_python_argv(
+            *cmd[1:],
+            executable=cmd[0],
+            force_isolation=True,
         )
 
     # Apply OS-level sandbox to app backend process.

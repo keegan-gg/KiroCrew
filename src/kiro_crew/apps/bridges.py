@@ -556,8 +556,14 @@ def _pin_host_cli_command(app_name: str, cfg: dict[str, Any]) -> dict[str, Any]:
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{pkg_parent}{os.pathsep}{existing}" if existing else pkg_parent
     env.setdefault("KIROCREW_HOME", str(app_dir(app_name).parent.parent))
-    cfg["command"] = sys.executable
-    cfg["args"] = ["-s", "-m", "kiro_crew", *list(cfg.get("args") or [])]
+    argv = platform_compat.isolated_python_argv(
+        "-m",
+        "kiro_crew",
+        *list(cfg.get("args") or []),
+        force_isolation=True,
+    )
+    cfg["command"] = argv[0]
+    cfg["args"] = argv[1:]
     cfg["env"] = env
     return cfg
 
@@ -2034,6 +2040,20 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
     if not isinstance(command, str):
         return cfg
     name = command.strip()
+
+    def _isolate_selected_python() -> None:
+        args = list(cfg.get("args") or [])
+        declared_env = cfg.get("env")
+        has_pythonpath = isinstance(declared_env, dict) and bool(declared_env.get("PYTHONPATH"))
+        force_isolation = has_pythonpath or str(_DEPS_BOOT_PATH) in args
+        argv = platform_compat.isolated_python_argv(
+            *args,
+            executable=str(cfg["command"]),
+            force_isolation=force_isolation,
+        )
+        cfg["command"] = argv[0]
+        cfg["args"] = argv[1:]
+
     # Bound on every path: the shim arms below consult it even when the
     # deps-exposure block does not run (e.g. a gateway-module server).
     _deps_stamp_ok = False
@@ -2124,6 +2144,7 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
                 name,
                 _abi_shebang_interp,
             )
+            _isolate_selected_python()
             return cfg
         if _abi_matched_path and _deps_stamp_ok:
             # An ABI-MATCHED path python (the gateway executable by path, or
@@ -2155,7 +2176,13 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
     ):
         # Carries a path (or, on Windows, a drive qualifier like ``D:foo``,
         # which pathlib would treat as a new anchor and silently discard the
-        # venv prefix in the join below) — deliberate, never rewritten.
+        # venv prefix in the join below) — deliberate, never rewritten. An
+        # interpreter path keeps that exact executable but still receives the
+        # shared user-site isolation flag.
+        if name == sys.executable or (
+            app_root is not None and path_command_is_abi_matched(app_root, name)
+        ):
+            _isolate_selected_python()
         return cfg
     # ``python.exe`` / ``python3.exe`` are ordinary Windows spellings of the
     # same launchers; normalise the suffix so they get the interpreter policy
@@ -2275,6 +2302,8 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
                     *(cfg.get("args") or []),
                 ]
                 _strip_deps_pythonpath(cfg, deps_dir)
+    if base in _BARE_PYTHON or cfg.get("command") == sys.executable:
+        _isolate_selected_python()
     return cfg
 
 
