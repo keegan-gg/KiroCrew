@@ -55,7 +55,11 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_path,
 )
-from kiro_crew.config.sections import STT_LANGUAGE_AUTO
+from kiro_crew.config.sections import (
+    DECISION_BUCKET_MAX,
+    DECISION_BUCKET_MIN,
+    STT_LANGUAGE_AUTO,
+)
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
@@ -2075,6 +2079,22 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "type": "int",
         "min": _CU_MIN_SCREENSHOT_MAX_PX,
         "max": _CU_MAX_SCREENSHOT_MAX_PX,
+    },
+    # Decision seam (src/kiro_crew/decisions/). The enable and the sampling rate
+    # are the two values the Settings card writes; `provider.*` is deliberately
+    # NOT here. The endpoint would let a dashboard caller choose where the state
+    # a decision point collects is sent, and `api_key` is schema-`sensitive`, so
+    # the masked GET returns the sentinel for it — a PATCH offered next to that
+    # would let a caller overwrite a key it cannot read back. Both stay
+    # config-file-only, the same split telemetry.beacon_endpoint already has.
+    #
+    # Bounds come from the config section itself, so this write gate and the
+    # load-time clamp in `DecisionsConfig.from_raw` cannot drift.
+    "decisions.enabled": {"type": "bool"},
+    "decisions.bucket": {
+        "type": "int",
+        "min": DECISION_BUCKET_MIN,
+        "max": DECISION_BUCKET_MAX,
     },
 }
 

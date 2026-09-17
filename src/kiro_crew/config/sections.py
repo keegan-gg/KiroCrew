@@ -5656,6 +5656,175 @@ class InstancesConfig:
             object.__setattr__(self, "probe_failure_threshold", _DEFAULT_PROBE_FAILS)
 
 
+# Sampling bucket bounds, as a percentage of sessions. 0 admits nothing, 100
+# admits everything; both the parse below and the gate clamp to this range rather
+# than treating an out-of-range value as a second way to disable the seam.
+DECISION_BUCKET_MIN = 0
+DECISION_BUCKET_MAX = 100
+
+DECISION_PROVIDER_ENDPOINT_DEFAULT = "https://api.typesafe.ai/v1/systemone"
+
+
+@dataclass
+class DecisionProviderConfig:
+    """Where the System One provider lives and what one call may cost."""
+
+    endpoint: str = field(
+        default=DECISION_PROVIDER_ENDPOINT_DEFAULT,
+        metadata=_meta(
+            "Endpoint",
+            "Full URL of the evaluation endpoint. Override only to point at a "
+            "compatible proxy — the request and response field names are fixed by "
+            "the TypeSafe API, not by this setting.",
+        ),
+    )
+    api_key: str = field(
+        default="secret://TYPESAFE_API_KEY",
+        metadata=_meta(
+            "API Key",
+            "The provider credential. Prefer the 'secret://NAME' form, which "
+            "reads NAME from the dashboard secrets vault so no key is stored in "
+            "config.json. A literal value is still accepted for an operator "
+            "mid-migration. With no usable key the seam logs a row saying so and "
+            "returns None — it never sends an empty bearer token.",
+            sensitive=True,
+        ),
+    )
+    model: str = field(
+        default="jev-latest",
+        metadata=_meta(
+            "Model",
+            "Provider model id. 'jev-latest' is TypeSafe's flagship System One " "model.",
+        ),
+    )
+    timeout_ms: int = field(
+        default=1000,
+        metadata=_meta(
+            "Timeout (ms)",
+            "Total budget for one decision, in milliseconds. Exceeding it logs "
+            "error='timeout' and returns None, so this is the ceiling the seam "
+            "adds to the path it sits in — not a target. Values at or below zero "
+            "are floored to 1ms rather than disabling the timeout.",
+        ),
+    )
+
+
+@dataclass
+class DecisionsConfig:
+    """Decision seam (``src/kiro_crew/decisions/``). Off by default.
+
+    ``enabled`` is the whole switch, and it is a STRICT opt-in: only the JSON
+    literal ``true`` enables the seam. ``"true"``, ``1`` and every other truthy
+    value parse to off, because this is the value that lets conversation state
+    leave the machine and a config nobody wrote for that purpose must not open
+    it. There is deliberately no per-point arm and no shadow mode: one point
+    ships (``skills.select``), and a mode whose only difference is that the
+    answer is discarded was a second thing to configure for an observation the
+    log already records.
+
+    Every field is hot-applied (no ``restart=True`` anywhere): the gate reads the
+    live snapshot per call, so flipping ``enabled`` takes effect on the next
+    decision without a gateway restart. That is what makes it usable as a kill
+    switch.
+    """
+
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Enabled",
+            "Main switch for the decision seam. False (the default) means every "
+            "decision point returns None with no network call and no log write. "
+            "True lets the sampling bucket decide. Turning this on can send the "
+            "state a point collects to the configured provider.",
+        ),
+    )
+    bucket: int = field(
+        default=DECISION_BUCKET_MAX,
+        metadata=_meta(
+            "Bucket (%)",
+            "Percentage of sessions the seam fires for, 0-100, decided by a hash "
+            "of the session key so a session is consistently in or out. 0 fires "
+            "for nobody, 100 for everybody. Out-of-range values are clamped — use "
+            "'enabled' to switch the seam off, not a zero bucket.",
+        ),
+    )
+    provider: DecisionProviderConfig = field(
+        default_factory=DecisionProviderConfig,
+        metadata=_meta("Provider", "Where decisions are sent and what they may cost."),
+    )
+
+    @classmethod
+    def from_raw(cls, section: object) -> "DecisionsConfig":
+        """Build from a raw ``decisions`` dict -- the ONE parse site.
+
+        Lives here rather than in the loader because the bucket bounds are
+        declared a few lines above, and a normalizer that read them from another
+        module would need those names re-exported across a frozen module boundary
+        (``test_config_module_boundaries``).
+
+        Every value is NORMALIZED rather than validated-and-rejected: this
+        section gates a seam that is off by default, so the fail-closed reading
+        of any unreadable value is the default, and a hand-edited config.json
+        must not stop the gateway booting.
+
+        Accepts whatever ``json.loads`` produced, including ``None`` and a
+        non-dict, for the same reason ``ResourceLimitsConfig.from_raw`` does. A
+        config carrying the earlier ``preview``/``points`` spelling parses to the
+        default -- OFF -- because no key of that shape is read here: a migration
+        that inferred ``enabled`` from a per-point arm would turn the seam on
+        from a value the operator set against a different contract.
+        """
+        if not isinstance(section, dict):
+            return cls()
+
+        raw_provider = section.get("provider")
+        raw_provider = raw_provider if isinstance(raw_provider, dict) else {}
+
+        def _text(key: str, default: str) -> str:
+            """A non-empty stripped string, else *default*.
+
+            An empty or blank value resolves to the DEFAULT rather than to ``""``:
+            the implementation falls back to the documented endpoint and model
+            anyway, so storing ``""`` would leave the saved config disagreeing
+            with what is in force -- the same reason ``bucket`` is clamped here.
+            """
+            raw = raw_provider.get(key)
+            return raw.strip() if isinstance(raw, str) and raw.strip() else default
+
+        provider = DecisionProviderConfig(
+            endpoint=_text("endpoint", DecisionProviderConfig.endpoint),
+            api_key=_text("api_key", DecisionProviderConfig.api_key),
+            model=_text("model", DecisionProviderConfig.model),
+            timeout_ms=_safe_int(
+                raw_provider.get("timeout_ms", DecisionProviderConfig.timeout_ms),
+                DecisionProviderConfig.timeout_ms,
+            ),
+        )
+
+        return cls(
+            # ``is True``, spelled out here rather than delegated: this is the
+            # switch for sending conversation state off the machine, so the
+            # condition that opens it should be readable without following a
+            # helper. ``bool("false")`` is True and ``bool(1)`` is True, and
+            # either would ENABLE the seam from a hand-edited value that says
+            # nothing of the kind. Only the JSON literal ``true`` parses to a
+            # Python ``True``, so only that enables.
+            enabled=section.get("enabled") is True,
+            # Clamped here as well as in the gate. The gate clamps because it
+            # must never trust a value it did not parse; clamping here is what
+            # makes the SAVED config say what is in force, so an operator who
+            # wrote 500 sees 100 come back rather than a number that behaves as
+            # 100 while reading as 500.
+            bucket=_safe_int(
+                section.get("bucket", DECISION_BUCKET_MAX),
+                DECISION_BUCKET_MAX,
+                DECISION_BUCKET_MIN,
+                DECISION_BUCKET_MAX,
+            ),
+            provider=provider,
+        )
+
+
 @dataclass
 class HeartbeatConfig:
     """Heartbeat background task queue (~/.kiro/crew/workspace/HEARTBEAT.md)."""

@@ -8,7 +8,8 @@ import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/
 import { FeaturePreviewIntroButton, type FeaturePreviewIntro } from '../../components/FeaturePreviewIntroDialog'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_CREW, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
-import { DECISIONS_PREVIEW_PATH, readDecisionsPreview } from './decisionsPreview'
+import { DECISIONS_ENABLED_PATH, DECISIONS_LIVE_POINT, readDecisions } from './decisionsPreview'
+import { fmtPercent } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 
 /**
@@ -54,16 +55,23 @@ import { i18nT } from '../../i18n/t'
  * page it holds. The PAGE stays un-advertised: `getAdvertisedSurfaces()` and
  * the Search Everywhere Pages provider still filter it until the flag is on.
  *
- * No `configKey` on these toggles, deliberately — INCLUDING the one whose value
- * really is a `config.json` path (Decisions, below). That prop is what makes a
- * `<SettingRef>` chip deep-link here, and it also feeds
- * `settingsRegistry.gen.ts`, whose every `configKey` is asserted to exist in the
- * backend `SCHEMA_REGISTRY` (`test/test_settingref_schema_fixture.py`). A
- * frontend that ships before the schema entry does would fail that guard, which
- * is precisely the split this file has to survive. The four `previewFlags.ts`
- * toggles have no path to name at all. Search deep-links still reach every
- * toggle through its registry id + `data-setting-label`, which need no
- * configKey.
+ * No `configKey` on the four `previewFlags.ts` toggles, deliberately: that prop
+ * is what makes a `<SettingRef>` chip deep-link here and what feeds
+ * `settingsRegistry.gen.ts`, and a per-device localStorage flag has no config
+ * path to name at all. Search deep-links still reach every toggle through its
+ * registry id + `data-setting-label`, which need no configKey.
+ *
+ * The Decisions toggle below DOES carry one, and it is spelled as a string
+ * literal (`configKey="decisions.enabled"`) rather than the constant it equals.
+ * `scripts/settingsExtract.ts` reads props out of the source text, so an
+ * identifier expression extracts as nothing and the registry entry silently
+ * loses its config key — the failure is a chip that degrades to a CLI popover
+ * while a real toggle exists. The literal and the constant are held equal by
+ * `decisionsPreview.test.ts`, and the key itself is held against the backend
+ * `SCHEMA_REGISTRY` by `test/test_settingref_schema_fixture.py`. Widening the
+ * extractor to follow the identifier is NOT the fix: it reads text on purpose,
+ * and one duplicated string with a drift assertion on it is cheaper than a
+ * resolver that has to understand imports.
  *
  * Each card may also carry a "See what it looks like" button (`FeaturePreviewIntroButton`)
  * opening a dialog with a REAL capture of the surface the flag reveals, a
@@ -122,44 +130,51 @@ const DECISIONS_EGRESS_NOTE_ID = 'decisions-preview-egress-note'
  *
  * The other four previews are `previewFlags.ts` keys — per-device localStorage,
  * because what they hold is a page this browser either draws or does not. What
- * this one holds is a gate that will run in the GATEWAY, which cannot read this
+ * this one holds is a gate that runs in the GATEWAY, which cannot read this
  * browser's localStorage — so the value has to live in `config.json`, and the
  * switch writes it through the same `PATCH /api/config/kirocrew` route the
  * Privacy panel's telemetry switch uses. Sharing the `['kirocrewConfig']` cache
  * entry with every other config reader is what keeps this switch from disagreeing
  * with the file about its own state.
  *
- * NOTHING READS `decisions.preview` YET, and that is the honest state of it: the
- * gate, the config section and the schema entry all arrive in a separate backend
- * PR. Stated here rather than implied because the alternative is a comment that
- * names a module in the present tense before it exists.
+ * WHAT IT NOW HOLDS, and why the copy changed: the shadow release asked the model
+ * three questions and threw every answer away. This one ADOPTS the answer at one
+ * point — `skills.select`, for the share of sessions the sampling bucket admits —
+ * so flipping this switch changes which skills a message loads. The other two
+ * points are retired rather than left listed: a row for a question whose answer
+ * nothing reads described a comparison, not a thing being turned on. A failure,
+ * a timeout or a refusal falls back to the same wording-match rule the build
+ * ships with, which is why the copy promises a fallback rather than an outage.
  *
- * Which means EVERY gateway answers the config GET with no `decisions` section
- * today, and would refuse the PATCH as a non-editable field. The switch therefore
- * renders DISABLED with the reason next to it rather than offering a write that
- * comes back 400 — the same stance the telemetry switch takes when an env var or
- * an overlay is what decides. When the backend lands, this toggle gains
- * `configKey={DECISIONS_PREVIEW_PATH}` and the cross-layer fixture guard
- * (`test/test_settingref_schema_fixture.py`) starts holding the two halves
- * together. That is tracked as issue #11510 — the guard being ENGAGED is the
- * deliverable there, not the prop.
+ * `decisions.preview` is NOT read as a fallback for the new field — see
+ * `decisionsPreview.ts` for why consent to a measurement is not consent to this.
+ * A gateway carrying only the old field is therefore reported as unsupported,
+ * with the same disabled switch and reason a pre-`decisions` gateway gets, rather
+ * than offering a write its PATCH allowlist refuses.
  *
- * The point rows are read-only on purpose. Which arm a point is on is an
- * experiment setting (`off` / `shadow` / `live`), not a preference: a reader here
- * is deciding whether to let the preview run at all, and offering three more
- * switches would imply this release can act on what the model answers. It
- * cannot — this release logs and discards.
+ * `configKey` is a LITERAL here, not `{DECISIONS_ENABLED_PATH}`: the settings
+ * extractor reads props out of source text. The section's own doc comment above
+ * carries the rest, including the two assertions that hold the literal, the
+ * constant and the backend schema entry together (issue #11510 — the guard being
+ * ENGAGED is the deliverable there, not the prop).
+ *
+ * The point row is READ-ONLY on purpose. The sampling rate is an experiment
+ * setting an operator moves in `config.json` (`decisions.bucket`), not a
+ * preference worth a second control on a preview card: a reader here is deciding
+ * whether to let it run at all, and a percentage slider next to the switch would
+ * imply the two are the same kind of choice.
  *
  * NO "See what it looks like" button, and that is the missing-capture rule the
  * "Chat on a crew" card below states, not an omission: this preview draws no
- * surface at all. Everything it produces is a line in a log file.
+ * surface at all. What it changes is which skills load, and the receipts are
+ * lines in a log file.
  */
 function DecisionsPreviewCard() {
   const qc = useQueryClient()
   const configQ = useQuery({ queryKey: ['kirocrewConfig'], queryFn: () => api.kirocrewConfig() })
-  const view = readDecisionsPreview(configQ.data)
+  const view = readDecisions(configQ.data)
   const mut = useMutation({
-    mutationFn: (value: boolean) => api.patchConfig(DECISIONS_PREVIEW_PATH, value),
+    mutationFn: (value: boolean) => api.patchConfig(DECISIONS_ENABLED_PATH, value),
     // Refetch rather than trusting the value just sent: the server owns the
     // effective verdict, and only it knows whether an overlay shadowed the write.
     //
@@ -185,12 +200,16 @@ function DecisionsPreviewCard() {
       <SettingsToggle
         label={i18nT('pages.developer.featurePreviewsTab.decisions')}
         description={i18nT('pages.developer.featurePreviewsTab.decisions_desc')}
-        checked={view.preview}
+        checked={view.enabled}
         onChange={v => mut.mutate(v)}
         // A config that has not been read, or could not be, is no basis for
         // offering a write against the value it holds.
         disabled={configQ.isLoading || configQ.isError || !view.supported || mut.isPending}
         describedBy={describedBy}
+        // A LITERAL, deliberately — `settingsExtract.ts` reads this prop out of
+        // the source text and an identifier extracts as nothing. Held equal to
+        // `DECISIONS_ENABLED_PATH` by `decisionsPreview.test.ts`.
+        configKey="decisions.enabled"
       />
       {/* The egress fact carries body weight, not muted fine print: it is what a
           reader is actually consenting to, and it stays outside the row so a
@@ -220,24 +239,40 @@ function DecisionsPreviewCard() {
           message={i18nT('pages.developer.featurePreviewsTab.decisions_save_failed')}
         />
       )}
-      {/* Only rendered for points the config actually exposes: a row invented for
-          a point the gateway does not carry would describe an arm nothing is on. */}
-      {view.arms.length > 0 && (
+      {/* Only rendered against a gateway that carries the field: on an older one
+          there is no point wired at all, so a row saying "off" would describe a
+          check that does not exist rather than one that is switched off. */}
+      {view.supported && (
         <div className="pt-1">
           <div className="text-[12px] text-muted mb-1">
             {i18nT('pages.developer.featurePreviewsTab.decisions_points')}
           </div>
-          <ul className="list-none p-0 m-0 flex flex-col gap-1">
-            {view.arms.map(({ point, arm }) => (
-              // The point name and the arm are config vocabulary, printed
-              // verbatim in mono rather than translated: they are the strings a
-              // reader types into `config.json` or greps the log for.
-              <li key={point} className="flex items-center justify-between text-[12px]">
-                <span className="font-mono text-text">{point}</span>
-                <span className="font-mono text-muted">{arm}</span>
-              </li>
-            ))}
-          </ul>
+          {/* One row, and it follows the switch rather than the config's own
+              per-point vocabulary: `skills.select` is the only point whose answer
+              this release acts on. The point NAME stays mono and untranslated —
+              it is the string a reader greps the log for — while its state is
+              copy, because "on" is now a statement about behaviour rather than
+              the config's `arm` value printed back. */}
+          <div className="flex items-center justify-between text-[12px]">
+            <span className="font-mono text-text">{DECISIONS_LIVE_POINT}</span>
+            <span className="text-muted">
+              {view.enabled
+                ? i18nT('pages.developer.featurePreviewsTab.decisions_point_on')
+                : i18nT('pages.developer.featurePreviewsTab.decisions_point_off')}
+            </span>
+          </div>
+          {/* The rate is printed only when it says something the row does not:
+              while off nothing is sampled at all, and the reader (see
+              `decisionsPreview.ts`) already resolves "every session" to null. */}
+          {view.enabled && view.bucket !== null && (
+            <p className="text-[12px] text-muted mt-1">
+              {i18nT('pages.developer.featurePreviewsTab.decisions_point_sampled', {
+                // Through the format seam: Latin digits and a `%` are wrong for
+                // bn, and a bare `${n}%` would follow the browser's locale.
+                percent: fmtPercent(view.bucket / 100),
+              })}
+            </p>
+          )}
         </div>
       )}
     </SettingsCard>
@@ -386,8 +421,8 @@ export function FeaturePreviewsSection() {
         />
       </SettingsCard>
       {/* LAST, and the only card here whose switch is not a per-device flag: it
-          writes `decisions.preview` in `config.json`. Its own doc comment carries
-          why, and why its point rows are read-only. */}
+          writes `decisions.enabled` in `config.json`. Its own doc comment carries
+          why, and why its one point row is read-only. */}
       <DecisionsPreviewCard />
     </SettingsSection>
     </div>

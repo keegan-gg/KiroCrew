@@ -5,9 +5,9 @@
  * other preview in that section: its switch is a `config.json` value written
  * through `PATCH /api/config/kirocrew`, not a per-device localStorage flag. So
  * the cases are the states a backend-backed switch can be in — read pending,
- * read failed, section absent, section present, write failed — and the claim in
- * each is the same one: the card never offers a write it cannot make, and never
- * stays silent about why.
+ * read failed, field absent, retired field only, field present, write failed —
+ * and the claim in each is the same one: the card never offers a write it cannot
+ * make, and never stays silent about why.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, cleanup, waitFor } from '@testing-library/react'
@@ -49,8 +49,9 @@ describe('Decisions (Jev) preview card', () => {
     expect(decisionsSwitch().getAttribute('aria-disabled')).toBe('true')
   })
 
-  it('disables itself and names the gateway when the config carries no decisions section', async () => {
-    // The state on `main` today: the frontend ships before the backend field.
+  it('disables itself and names the gateway when the config carries no decisions field', async () => {
+    // The frontend ships before the backend field whenever a user updates one
+    // half first.
     vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ telemetry: {} } as never)
     renderSection()
     await waitFor(() => {
@@ -58,6 +59,25 @@ describe('Decisions (Jev) preview card', () => {
     })
     expect(decisionsSwitch().getAttribute('aria-disabled')).toBe('true')
     expect(decisionsSwitch().getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('treats a gateway carrying only the retired preview flag as an old gateway', async () => {
+    // A shadow-era gateway HAS a `decisions` section, and `preview: true` was a
+    // yes to a seam that discarded its answer. Reading either as support for this
+    // switch would offer a write the PATCH allowlist refuses, against consent
+    // nobody gave for a behaviour change.
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({
+      decisions: { preview: true, points: { 'skills.select': { arm: 'shadow' } } },
+    } as never)
+    const patch = vi.spyOn(api, 'patchConfig').mockResolvedValue({} as never)
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/older than this switch/i)).toBeInTheDocument()
+    })
+    expect(decisionsSwitch().getAttribute('aria-disabled')).toBe('true')
+    expect(decisionsSwitch().getAttribute('aria-checked')).toBe('false')
+    decisionsSwitch().click()
+    expect(patch).not.toHaveBeenCalled()
   })
 
   it('says the read failed rather than blaming the gateway version', async () => {
@@ -73,7 +93,7 @@ describe('Decisions (Jev) preview card', () => {
   })
 
   it('reflects the stored flag and writes the config path when flipped', async () => {
-    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ decisions: { preview: false } } as never)
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ decisions: { enabled: false } } as never)
     const patch = vi.spyOn(api, 'patchConfig').mockResolvedValue({} as never)
     renderSection()
     await waitFor(() => {
@@ -82,13 +102,14 @@ describe('Decisions (Jev) preview card', () => {
     decisionsSwitch().click()
     await waitFor(() => {
       // The path matters more than the click: a localStorage key here would look
-      // identical on screen and be invisible to the gate that reads it.
-      expect(patch).toHaveBeenCalledWith('decisions.preview', true)
+      // identical on screen and be invisible to the gate that reads it, and the
+      // retired `decisions.preview` would be refused by the allowlist.
+      expect(patch).toHaveBeenCalledWith('decisions.enabled', true)
     })
   })
 
   it('shows the stored flag as on, and offers turning it back off', async () => {
-    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ decisions: { preview: true } } as never)
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ decisions: { enabled: true } } as never)
     const patch = vi.spyOn(api, 'patchConfig').mockResolvedValue({} as never)
     renderSection()
     await waitFor(() => {
@@ -96,7 +117,7 @@ describe('Decisions (Jev) preview card', () => {
     })
     decisionsSwitch().click()
     await waitFor(() => {
-      expect(patch).toHaveBeenCalledWith('decisions.preview', false)
+      expect(patch).toHaveBeenCalledWith('decisions.enabled', false)
     })
   })
 
@@ -110,7 +131,7 @@ describe('Decisions (Jev) preview card', () => {
     let reads = 0
     vi.spyOn(api, 'kirocrewConfig').mockImplementation((() => {
       reads += 1
-      if (reads === 1) return Promise.resolve({ decisions: { preview: false } })
+      if (reads === 1) return Promise.resolve({ decisions: { enabled: false } })
       return new Promise(resolve => { releaseRefetch = resolve })
     }) as never)
     vi.spyOn(api, 'patchConfig').mockResolvedValue({} as never)
@@ -121,14 +142,14 @@ describe('Decisions (Jev) preview card', () => {
     })
     decisionsSwitch().click()
     await waitFor(() => {
-      expect(api.patchConfig).toHaveBeenCalledWith('decisions.preview', true)
+      expect(api.patchConfig).toHaveBeenCalledWith('decisions.enabled', true)
     })
     // The PATCH has resolved and the refetch has not. The switch still shows the
     // stored value, so it must not accept another click against it.
     expect(decisionsSwitch().getAttribute('aria-checked')).toBe('false')
     expect(decisionsSwitch().getAttribute('aria-disabled')).toBe('true')
 
-    releaseRefetch({ decisions: { preview: true } })
+    releaseRefetch({ decisions: { enabled: true } })
     await waitFor(() => {
       expect(decisionsSwitch().getAttribute('aria-checked')).toBe('true')
     })
@@ -136,7 +157,7 @@ describe('Decisions (Jev) preview card', () => {
   })
 
   it('reports a refused write instead of leaving the switch looking flipped', async () => {
-    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ decisions: { preview: false } } as never)
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ decisions: { enabled: false } } as never)
     vi.spyOn(api, 'patchConfig').mockRejectedValue(new Error('field not editable'))
     renderSection()
     await waitFor(() => {
@@ -162,37 +183,89 @@ describe('Decisions (Jev) preview card', () => {
     })
   })
 
-  it('lists the arms the config exposes, and nothing when it exposes none', async () => {
+  it('names Jev as the recipient and the fallback as the shipped rule', async () => {
+    // The two things the shadow-only copy did not have to say, now that the
+    // answer is acted on: where the data goes, and what happens when the answer
+    // does not arrive.
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ decisions: { enabled: true } } as never)
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/sent over the internet to Jev/i)).toBeInTheDocument()
+    })
+    expect(screen.getByText(/falls back to the same rule/i)).toBeInTheDocument()
+  })
+
+  it('shows the one live point as on, and no rows the release retired', async () => {
     vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({
-      decisions: {
-        preview: true,
-        points: { 'skills.select': { arm: 'shadow' }, 'cron.novelty': { arm: 'off' } },
-      },
+      decisions: { enabled: true, bucket: 100 },
     } as never)
     renderSection()
     await waitFor(() => {
       expect(screen.getByText('skills.select')).toBeInTheDocument()
     })
-    expect(screen.getByText('cron.novelty')).toBeInTheDocument()
-    // The point with no arm in the config gets no row: there is nothing true to
-    // print in it.
+    // Read off the ROW rather than the document: "On" is two characters and
+    // would happily match a word inside another card's copy.
+    expect(screen.getByText('skills.select').parentElement?.textContent).toBe('skills.selectEnabled')
+    // The two shadow-release rows are gone, not merely empty: nothing consumes
+    // their answers, so a row for them would describe a comparison.
     expect(screen.queryByText('skills.dedupe')).toBeNull()
+    expect(screen.queryByText('cron.novelty')).toBeNull()
+    // Every session is what "on" already means, so no rate is printed.
+    expect(screen.queryByText(/Jev answers for/i)).toBeNull()
   })
 
-  it('carries no point rows at all when the config has no arms to show', async () => {
-    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ decisions: { preview: false } } as never)
+  it('shows the point as off while the switch is off, and prints no rate', async () => {
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({
+      decisions: { enabled: false, bucket: 25 },
+    } as never)
     renderSection()
     await waitFor(() => {
-      expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
+      expect(screen.getByText('skills.select')).toBeInTheDocument()
     })
-    expect(screen.queryByText(/each check below shows the mode/i)).toBeNull()
+    expect(screen.getByText('skills.select').parentElement?.textContent).toBe('skills.selectOff')
+    // Nothing is sampled while the seam is off, so a rate here would name a
+    // share of sessions that is not being decided by anything. Matched on the
+    // sampling sentence's own opening, because the card's description also says
+    // "of your sessions".
+    expect(screen.queryByText(/Jev answers for/i)).toBeNull()
+  })
+
+  it('prints the sampling rate when the config narrows it', async () => {
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({
+      decisions: { enabled: true, bucket: 25 },
+    } as never)
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/25% of your sessions/i)).toBeInTheDocument()
+    })
+    // Zero is a state worth printing too: on, and deciding for nobody.
+    cleanup()
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({
+      decisions: { enabled: true, bucket: 0 },
+    } as never)
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/0% of your sessions/i)).toBeInTheDocument()
+    })
+  })
+
+  it('carries no point row at all against a gateway without the field', async () => {
+    // An older gateway has no point wired, so a row reading "off" would describe
+    // a check that does not exist rather than one that is switched off.
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ telemetry: {} } as never)
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/older than this switch/i)).toBeInTheDocument()
+    })
+    expect(screen.queryByText('skills.select')).toBeNull()
+    expect(screen.queryByText(/runs on Jev's answer today/i)).toBeNull()
   })
 
   it('leaves the four localStorage previews alone', async () => {
     // The section mixes two kinds of switch now. Flipping the backend one must
     // not write a preview flag — a stray one would turn an unrelated unreleased
     // page on for this device.
-    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ decisions: { preview: false } } as never)
+    vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({ decisions: { enabled: false } } as never)
     vi.spyOn(api, 'patchConfig').mockResolvedValue({} as never)
     renderSection()
     await waitFor(() => {

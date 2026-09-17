@@ -3071,6 +3071,19 @@ class ContextBuilder:
         self.lessons = lessons or LessonStore()
         self.conversation_log = conversation_log
         self.channel_history = channel_history
+        # Captured for the DecisionOracle point at `skills.select`. Production
+        # reaches `build_message` only through `run_in_embed_pool`, a thread
+        # executor with no running loop, so the point cannot obtain one where it
+        # fires; every ContextBuilder construction site runs inside `async def`,
+        # so this is where a loop exists to capture. Same shape and same reason
+        # as `HistoryConsolidator._event_loop`. `None` outside a loop -- a sync
+        # test, a script -- means the point simply does not run and trigger
+        # matching's own selection ships, which is the seam's normal refusal
+        # rather than an error.
+        try:
+            self._decisions_loop: "asyncio.AbstractEventLoop | None" = asyncio.get_running_loop()
+        except RuntimeError:
+            self._decisions_loop = None
         self.memory_mode_for_session: Callable[[str], Awaitable[str]] | None = None
         self._session_memory_modes: dict[str, str] = {}
         if bot_name:
@@ -4803,6 +4816,43 @@ class ContextBuilder:
         # in the window.
         if not is_custom and not minimal_context:
             triggered = self.skills.get_triggered_skills(text, project_dir=project)
+
+            # DecisionOracle (skills.select) — when the point is enabled for
+            # this session, one oracle pick REPLACES what trigger matching
+            # chose, and it is consumed here, above the split, so the pick
+            # travels the same body/pointer, confinement and audit path as any
+            # matched skill. `None` means "keep the selection above", which
+            # covers the point being off, an unusable answer, a failure and an
+            # expired budget alike; `[]` is a real answer of "no skill applies".
+            #
+            # The wait is bounded and paid on THIS thread. `build_message` is
+            # synchronous and production reaches it only through
+            # `run_in_embed_pool`, a thread executor, so the skill-tree walk and
+            # the wait happen on a worker while the loop captured at
+            # construction runs only the `decide` await. A caller that is
+            # itself on a loop thread keeps the baseline rather than blocking
+            # that loop.
+            try:
+                from kiro_crew.decisions.points.skills_select import selected_skills
+
+                _selected = selected_skills(
+                    self.skills,
+                    text,
+                    project,
+                    session_key=session_key,
+                    loop=self._decisions_loop,
+                )
+                if _selected is not None and list(_selected) != list(triggered):
+                    logger.info(
+                        "skills.select: oracle selection %s replaced %s",
+                        ", ".join(_selected) or "-",
+                        ", ".join(triggered) or "-",
+                    )
+                if _selected is not None:
+                    triggered = list(_selected)
+            except Exception:
+                logger.debug("skills.select selection skipped", exc_info=True)
+
             if triggered:
                 enforced, pointer_only = self.skills.split_triggered(triggered, project)
                 # Log the split, not just the match: a pointed-at skill the
