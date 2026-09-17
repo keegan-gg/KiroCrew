@@ -124,6 +124,8 @@ export const CHUNK_BUDGETS = {
   // was set at 3.7% over its own measurement, below the 5% convention, and
   // ordinary catalog growth since then used that margin up. Back to the 5%
   // convention over the measured size.
+  // The Projects (thin Project) surface adds ~48 English UI strings and no
+  // runtime dependency, which fits inside the headroom above.
   t: 861 * KB, // measured 820.3 KB on the capability-inheritance build rebased onto f382f0a70 (~5% headroom)
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
