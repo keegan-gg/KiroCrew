@@ -6,7 +6,7 @@ const path = require("path");
 const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
 const { createRendererRecovery } = require("./renderer-recovery");
 const { createHangRecovery } = require("./hang-recovery");
-const { armSplashHistoryClear } = require("./splash-history");
+const { armSplashHistoryClear, isTransientShellPage } = require("./splash-history");
 const { hideToTray, cancelPendingTrayHide } = require("./hide-to-tray");
 const { attachHtmlFullScreen } = require("./html-fullscreen");
 const { createDisplayMediaHandler } = require("./display-media");
@@ -1746,9 +1746,32 @@ function createWindowLifecycle(options) {
   }
 
   function handleWindowControl(sender, action) {
-    if (!LINUX_FRAMELESS) return;
     const win = windowForWebContents(sender);
-    if (win) applyWindowControl(win, action);
+    if (!win) return;
+    if (LINUX_FRAMELESS) {
+      applyWindowControl(win, action);
+      return;
+    }
+    // Off Linux the OS draws the captions, so this channel stays closed to the
+    // dashboard. The one admission is `close` from a transient shell page
+    // (loading.html / token-prompt.html): those pages are painted into this
+    // window with no chrome of their own, and on macOS the window may have no
+    // reachable close control at that moment -- native fullscreen hides the
+    // traffic lights, and focus mode hides them in windowed mode with nothing
+    // left to restore them once the dashboard document is gone. `close` runs
+    // the window's own close handler, which hides to tray and leaves fullscreen
+    // first, exactly like the native button. The URL gate keeps the dashboard
+    // (always http/https) unable to close its own window through IPC.
+    if (action !== "close" || !isTransientShellPage(senderUrl(sender))) return;
+    applyWindowControl(win, "close");
+  }
+
+  function senderUrl(sender) {
+    try {
+      return typeof sender?.getURL === "function" ? sender.getURL() : "";
+    } catch {
+      return ""; // mid-teardown: fail closed, no admission
+    }
   }
 
   function setThemeMode(pref) {
