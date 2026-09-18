@@ -162,7 +162,15 @@ _CANONICAL_CONSUMER_EXPR = "${{ needs.changes.outputs.linux_runner || 'ubuntu-la
 _CANONICAL_CONSUMER_EXPR_LARGE = (
     "${{ needs.changes.outputs.linux_runner_large || 'ubuntu-latest' }}"
 )
+# `backend-test` pilots ONE shard (group 1) on the CodeBuild fleet as a
+# canary (#11699); the other shards stay on ubuntu-latest until it holds.
+# It still reads the resolver -- never a literal fleet label -- so it
+# belongs in this census with its canary-conditional form.
+_CANARY_SHARD1_CONSUMER_EXPR = (
+    "${{ matrix.group == 1 && needs.changes.outputs.linux_runner_large " "|| 'ubuntu-latest' }}"
+)
 _EXPECTED_RESOLVER_CONSUMER_JOBS = {
+    ("ci.yml", "backend-test"): _CANARY_SHARD1_CONSUMER_EXPR,
     ("ci.yml", "backend-test-crew-container"): _CANONICAL_CONSUMER_EXPR,
     ("ci.yml", "coverage-combine"): _CANONICAL_CONSUMER_EXPR,
     ("ci.yml", "coverage-gate"): _CANONICAL_CONSUMER_EXPR,
