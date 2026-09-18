@@ -47,6 +47,12 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/update/arm", handlers.api_update_arm)
     app.router.add_get("/api/update/arm", handlers.api_update_arm_status)
     app.router.add_post("/api/update/approve", handlers.api_update_approve)
+    # The packaged desktop host's poll: it reports its updater state and drains
+    # an approved install. Internal-secret only (the handler re-asserts it), and
+    # outbound-only from Electron's point of view — the same direction of control
+    # the browser command channel established, so no inbound port is opened on
+    # the process that owns the dashboard session.
+    app.router.add_post("/api/update/app-bridge", handlers.api_update_app_bridge)
     # Restart with no update. Sibling of /api/update rather than a mode of it:
     # /api/update refuses every layout that is not a git checkout, while a
     # restart is valid everywhere and is how a wheel install picks up code a

@@ -64,6 +64,11 @@ const UPDATE_HANDLES = [
   "update:install",
   "update:set-auto-download",
   "update:set-channel",
+  // Agent-armed update step-up (#503). Registered on EVERY path, including the
+  // init-failure fallback, for the same reason the rest are: the renderer must
+  // get a refusal it can render, not a missing-handler rejection.
+  "update:armed-status",
+  "update:approve-armed",
 ].sort();
 
 function fakeStore(initial = {}) {
@@ -1048,7 +1053,7 @@ test("bind and unregister remain owned by the dedicated hotkey helper", () => {
   assert.equal(h.hotkey.state.current, "");
 });
 
-test("registerUpdater owns six handlers and preserves lazy gateway hooks", async () => {
+test("registerUpdater owns the update handler roster and preserves lazy gateway hooks", async () => {
   const updater = updaterHandle({ disabled: "test-disabled" });
   let initCalls = 0;
   let deps;

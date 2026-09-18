@@ -13156,6 +13156,12 @@
         "copy_failed_select_the_link_and_copy_it_manually": "No se pudo copiar. Selecciona el enlace y cópialo manualmente."
       },
       "aboutPanel": {
+        "agent_armed_expires_in": "Esta solicitud caduca en {{time}}",
+        "agent_armed_failed": "No se pudo iniciar la actualización",
+        "agent_armed_install": "Instalar y reiniciar",
+        "agent_armed_installing": "Instalando: la aplicación se reiniciará sola.",
+        "agent_armed_update_body": "¿Instalar la v{{version}}? Nada cambia en este equipo hasta que confirmes.",
+        "agent_armed_update_heading": "Un agente solicitó una actualización",
         "diverged": "Divergente",
         "checkout_diverged_from_upstream": "Este checkout ha divergido de su upstream ({{distance}}). Haz rebase o merge para actualizar; nada se aplica automáticamente, así que tus commits locales están a salvo.",
         "commits_ahead_one": "{{count}} commit por delante",

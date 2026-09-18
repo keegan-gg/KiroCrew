@@ -199,6 +199,8 @@
       "browser-ops.js",
       "browser-annotate.js",
       "browser-agent-channel.js",
+      "app-update-bridge.js",
+      "update-approval.js",
       "external-scheme.js",
       "validation.js",
       "context-menu.js",

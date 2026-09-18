@@ -745,6 +745,16 @@ function manualDownloadUrl(channel, osPlatform, osArch = process.arch, linuxForm
  *                               "armed" flag that is never cleared plus an
  *                               awaited stopGateway() on EVERY quit path.
  *
+ *                               The agent-armed path added for #503 does NOT
+ *                               change this. It installs through
+ *                               applyUpdateAndRestart() -- the same awaited
+ *                               stopGateway() + quitAndInstall sequence the
+ *                               human's Install button uses -- and its arming
+ *                               flag is one-shot: every outcome that can follow
+ *                               a check either consumes or releases it, so it is
+ *                               the opposite of the never-cleared flag an
+ *                               install-on-quit would need.
+ *
  * - allowDowngrade=true       our update gate is DIFFERENCE-based, not
  *                             greater-than: a feed repointed to an older
  *                             version must be offered. This is what makes
@@ -1543,6 +1553,27 @@ function initAutoUpdate(deps) {
   let installing = false;
   let quitHandled = false;
   let checking = false;
+  // An APPROVED install waiting for bytes, or null. Set only by
+  // installWhenReady() -- i.e. only after the gateway consumed a step-up nonce,
+  // which is the host-identity proof a remote dashboard bearer cannot produce.
+  //
+  // It is a ONE-SHOT: every outcome that can follow a check either consumes it
+  // (update-downloaded) or releases it (not-available, a retraction, an error).
+  // A flag that survived its outcome would be the "armed flag that is never
+  // cleared" the autoInstallOnAppQuit note below rules out -- it would make a
+  // later, unrelated download install without anyone approving that one.
+  //
+  // This does NOT change autoInstallOnAppQuit, which stays false: an approved
+  // install goes through applyUpdateAndRestart(), the same awaited
+  // stopGateway() + quitAndInstall path the human's Install button uses.
+  let approvedInstall = null;
+
+  /** Release a pending approval without installing, and say why. */
+  function releaseApprovedInstall(why) {
+    if (approvedInstall === null) return;
+    log.info(`[update] releasing approved install for v${approvedInstall.version}: ${why}`);
+    approvedInstall = null;
+  }
   // The channel the LAST configureFeed() pointed the updater at. Captured at
   // check time because the update-available handler's direction gate must
   // compare the candidate against the channel its FEED was configured for, not
@@ -1855,6 +1886,48 @@ function initAutoUpdate(deps) {
     forceExitFailsafe("manual install");
   }
 
+  /**
+   * Install an APPROVED update: use the staged build if there is one, otherwise
+   * discover and download first, then install.
+   *
+   * This is the ONLY entry point that downloads and installs without a further
+   * click, and it is reachable only from the gateway's app-update bridge —
+   * which only ever queues a request whose step-up nonce was already consumed.
+   * So the consent this skips is the SECOND click, not the first: a human
+   * approved this exact version, on this host, within the step-up's TTL.
+   *
+   * Every refusal below is load-bearing. An install already in flight must not
+   * be re-dispatched (the app is mid-handoff), and a check that finds nothing
+   * must release the approval rather than leave it armed for whatever the feed
+   * offers next.
+   *
+   * @param {{version?: string}} [request]
+   * @returns {Promise<{ok: boolean, reason?: string}>}
+   */
+  async function installWhenReady(request) {
+    const version = (request && request.version) || "";
+    if (installing || quitHandled) {
+      log.info("[update] approved install ignored — an install is already in flight");
+      return { ok: false, reason: "install-in-flight" };
+    }
+    if (updateReady && stagedVersion) {
+      log.info(`[update] approved install: ${stagedVersion} already staged — installing`);
+      await applyUpdateAndRestart();
+      return { ok: true };
+    }
+    log.info(`[update] approved install: discovering (approved v${version || "latest"})`);
+    approvedInstall = { version };
+    // safeCheck owns its own error reporting. Its outcome drives the rest:
+    // update-available downloads (see the autoDownload derivation there),
+    // update-downloaded installs, and not-available / error release the
+    // approval so nothing stays armed.
+    await safeCheck();
+    if (approvedInstall === null && !installing && !updateReady) {
+      return { ok: false, reason: "nothing-to-install" };
+    }
+    return { ok: true };
+  }
+
   // If the user chose "Later", install on the natural quit. This is OUR
   // implementation rather than autoInstallOnAppQuit=true precisely because the
   // gateway must be stopped first; before-quit can't await async work, so
@@ -1980,6 +2053,13 @@ function initAutoUpdate(deps) {
     // preserved as-is.
     const phase = downloading ? "download" : installing ? "install" : "check";
     downloading = false;
+    if (phase !== "install") {
+      // A check or download that failed produced no bytes to install, so the
+      // approval has nothing left to consume. Releasing it here is what keeps
+      // it one-shot: left armed, it would install whatever a LATER download
+      // happened to stage, which nobody approved.
+      releaseApprovedInstall(`the ${phase} failed`);
+    }
     if (phase === "install") {
       // The dispatch is over: allow a retry (updateReady is still true -- the
       // zip is still staged) and tell the host to bring the gateway back.
@@ -2014,6 +2094,7 @@ function initAutoUpdate(deps) {
     stagedNotes = "";
     quitHandled = false;
     app.removeListener("before-quit", deferredInstallOnQuit);
+    releaseApprovedInstall("the feed reports this build is up to date");
     log.info("[update] up to date");
     emit("not-available");
   });
@@ -2072,6 +2153,7 @@ function initAutoUpdate(deps) {
         app.removeListener("before-quit", deferredInstallOnQuit);
       }
       foundVersion = null;
+      releaseApprovedInstall("the feed offers no newer build on this channel");
       emit("not-available");
       return;
     }
@@ -2093,9 +2175,13 @@ function initAutoUpdate(deps) {
       stagedNotes = "";
       app.removeListener("before-quit", deferredInstallOnQuit);
     }
-    let autoDownload = false;
+    // An APPROVED install downloads whatever the preference says. The
+    // preference governs unattended downloads; this one is not unattended — a
+    // human approved this install through the step-up, and refusing to fetch
+    // the bytes would make that approval silently do nothing.
+    let autoDownload = approvedInstall !== null;
     try {
-      autoDownload = !!getAutoDownloadPreference();
+      autoDownload = autoDownload || !!getAutoDownloadPreference();
     } catch (err) {
       // A throwing preference reader must not cost the user the discovery
       // nudge, and it must not be read as consent either — fall back to the
@@ -2136,6 +2222,19 @@ function initAutoUpdate(deps) {
     stagedVersion = (info && info.version) || null;
     stagedNotes = notesFrom(info);
     stagedWasAutomatic = downloadWasAutomatic;
+    if (approvedInstall !== null) {
+      // Consume BEFORE dispatching: applyUpdateAndRestart awaits stopGateway,
+      // and a second update-downloaded arriving in that window must not find
+      // the approval still armed and install twice.
+      const approved = approvedInstall;
+      approvedInstall = null;
+      log.info(
+        `[update] downloaded ${stagedVersion} — installing (approved v${approved.version || "latest"})`,
+      );
+      emit("downloaded", { version: stagedVersion || app.getVersion(), notes: stagedNotes });
+      void applyUpdateAndRestart();
+      return;
+    }
     log.info(`[update] downloaded ${stagedVersion} — ${uiDriven ? "notifying UI" : "prompting"}`);
     emit("downloaded", { version: stagedVersion || app.getVersion(), notes: stagedNotes });
     if (uiDriven) {
@@ -2179,6 +2278,22 @@ function initAutoUpdate(deps) {
     check: () => safeCheck(),
     download: () => startDownload(),
     install: () => applyUpdateAndRestart(),
+    /** Install an approved update (see installWhenReady). Bridge-only. */
+    installApproved: (request) => installWhenReady(request),
+    /**
+     * What the app-update bridge reports to the gateway each poll. The
+     * gateway has no other source for the packaged lane's available version —
+     * the CLI release feed it reads is a different release stream — so this is
+     * what lets `POST /api/update/arm` name a real target.
+     *
+     * A STAGED build counts as available: the bytes are already on disk, so an
+     * arm naming it is honest and its approval installs immediately.
+     */
+    bridgeState: () => ({
+      version: app.getVersion(),
+      available_version: stagedVersion || foundVersion || "",
+      channel: currentChannel(),
+    }),
     getInfo,
     isReady: () => updateReady,
   };

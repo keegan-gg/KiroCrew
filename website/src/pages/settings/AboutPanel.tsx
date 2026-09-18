@@ -585,6 +585,107 @@ export function InAppUpdateFlow({
   )
 }
 
+/** The desktop app's side of an agent-armed update (issue #503).
+ *
+ * An agent can ARM an app update through the gateway; only a host identity can
+ * approve one. On a packaged install THIS process's host is the machine the user
+ * is sitting at, so the shell can read the approval nonce itself — which makes
+ * this button the same authority as `kirocrew update approve` in a terminal,
+ * reachable by someone who never opens one. That is the gap the issue describes:
+ * a chat-only user who never clicks Settings > About stays pinned to the build
+ * they installed.
+ *
+ * What it must NOT be is an install that happens without a human. So the panel
+ * renders only while a request is genuinely armed, it names the version, and the
+ * click is the whole consent — the gateway refuses anything else.
+ *
+ * Absent on an older shell (no `armedStatus`/`approveArmed` on the bridge) and on
+ * a gateway-only install, where the main process answers `armed: false` rather
+ * than reaching across a remote seam.
+ */
+export function AgentArmedUpdateNotice({ api }: { api?: UpdateAPI }) {
+  const desktop = api ?? (typeof window === 'undefined' ? undefined : window.updateAPI)
+  const canApprove = !!desktop?.armedStatus && !!desktop?.approveArmed
+  const [dispatched, setDispatched] = useState(false)
+  const [error, setError] = useState('')
+  const armStatus = useQuery({
+    queryKey: ['desktop-armed-status'],
+    queryFn: () => desktop!.armedStatus!(),
+    enabled: canApprove,
+    // The arm's TTL is minutes, so a 5s poll is ample. It is also how the panel
+    // LEAVES: an approval landing in a terminal consumes the request, and the
+    // next poll answering `armed: false` is what takes this notice down.
+    refetchInterval: 5000,
+  })
+  const approve = useMutation({
+    mutationFn: () => desktop!.approveArmed!(),
+    onSuccess: res => {
+      // The bridge's contract is a RESOLVED `{ ok: false, error }` for a refusal,
+      // so a rejection is not the only failure shape — treating it as one would
+      // leave the button looking like it worked while nothing installs.
+      if (res && res.ok) {
+        setError('')
+        setDispatched(true)
+        return
+      }
+      setError((res && res.error) || i18nT('pages.settings.aboutPanel.agent_armed_failed'))
+    },
+    onError: () => setError(i18nT('pages.settings.aboutPanel.agent_armed_failed')),
+  })
+  const status = armStatus.data
+  // `managed_by` gates this deliberately: a managed-venv arm is approved with the
+  // host command InAppUpdateFlow already prints, and offering an app-install
+  // button for it would drive the wrong updater.
+  const armed = status?.armed === true && status?.managed_by === 'electron'
+  // Keep the panel mounted through the handoff. The approval consumes the arm, so
+  // the very next poll says `armed: false` — unmounting there would replace the
+  // "installing" line with nothing at the exact moment the app goes quiet.
+  if (!canApprove || (!armed && !dispatched)) return null
+  const version = status?.version || ''
+  const expiresIn = typeof status?.expires_in === 'number' ? status.expires_in : null
+  return (
+    <div
+      className="p-3 bg-bg rounded-lg border border-border flex flex-col gap-2"
+      data-testid="agent-armed-update"
+    >
+      <span className="text-[13px] font-medium text-text flex items-center gap-1.5">
+        <AlertCircle size={13} className="lucide-inline text-warn" />
+        {i18nT('pages.settings.aboutPanel.agent_armed_update_heading')}
+      </span>
+      {dispatched ? (
+        <span className="text-[12px] text-muted" data-testid="agent-armed-installing">
+          {i18nT('pages.settings.aboutPanel.agent_armed_installing')}
+        </span>
+      ) : (
+        <>
+          <span className="text-[12px] text-muted">
+            {i18nT('pages.settings.aboutPanel.agent_armed_update_body', { version })}
+          </span>
+          {expiresIn !== null && (
+            <span className="text-[12px] text-muted" data-testid="agent-armed-countdown">
+              {i18nT('pages.settings.aboutPanel.agent_armed_expires_in', {
+                time: `${Math.floor(expiresIn / 60)}:${String(expiresIn % 60).padStart(2, '0')}`,
+              })}
+            </span>
+          )}
+          <ErrorNotice message={error} askAgent testId="agent-armed-error" />
+          <div>
+            <Btn
+              primary
+              data-testid="agent-armed-approve"
+              disabled={approve.isPending}
+              onClick={() => approve.mutate()}
+            >
+              <RefreshCw size={13} className={`lucide-inline ${approve.isPending ? 'animate-spin' : ''}`} />{' '}
+              {i18nT('pages.settings.aboutPanel.agent_armed_install')}
+            </Btn>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 export function AboutPanel() {
   const { botName, avatar } = useBranding()
   const gatewayVersion = useAppSelector(s => s.dashboard.status?.version) || ''
@@ -1729,6 +1830,10 @@ export function AboutPanel() {
                   </span>
                 </p>
               )}
+              {/* Above the update card on purpose: an armed request is a
+                  pending decision, and the card below it is the ordinary
+                  check/download/install flow that decision bypasses. */}
+              <AgentArmedUpdateNotice />
               {updateCard}
               {/* Auto-download opt-out. ON by default, so this row is the only
                   place a user can decline the background download — it renders

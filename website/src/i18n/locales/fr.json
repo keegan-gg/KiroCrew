@@ -13156,6 +13156,12 @@
         "copy_failed_select_the_link_and_copy_it_manually": "Échec de la copie. Sélectionnez le lien et copiez-le manuellement."
       },
       "aboutPanel": {
+        "agent_armed_expires_in": "Cette demande expire dans {{time}}",
+        "agent_armed_failed": "Impossible de lancer la mise à jour",
+        "agent_armed_install": "Installer et redémarrer",
+        "agent_armed_installing": "Installation en cours — l'application redémarre d'elle-même.",
+        "agent_armed_update_body": "Installer la v{{version}} ? Rien ne change sur cette machine avant votre confirmation.",
+        "agent_armed_update_heading": "Un agent a demandé une mise à jour",
         "diverged": "Divergent",
         "checkout_diverged_from_upstream": "Ce checkout a divergé de son upstream ({{distance}}). Faites un rebase ou un merge pour mettre à jour — rien n'est appliqué automatiquement, vos commits locaux sont donc préservés.",
         "commits_ahead_one": "{{count}} commit d'avance",

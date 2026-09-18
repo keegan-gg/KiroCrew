@@ -12793,6 +12793,12 @@
         "copy_failed_select_the_link_and_copy_it_manually": "コピーに失敗しました。リンクを選択して手動でコピーしてください。"
       },
       "aboutPanel": {
+        "agent_armed_expires_in": "このリクエストは {{time}} で失効します",
+        "agent_armed_failed": "更新を開始できませんでした",
+        "agent_armed_install": "インストールして再起動",
+        "agent_armed_installing": "インストール中 — アプリは自動的に再起動します。",
+        "agent_armed_update_body": "v{{version}} をインストールしますか？確認するまで、このマシンには何も変更されません。",
+        "agent_armed_update_heading": "エージェントが更新をリクエストしました",
         "diverged": "分岐あり",
         "checkout_diverged_from_upstream": "このチェックアウトはアップストリームから分岐しています（{{distance}}）。rebase または merge で更新してください — 何も自動では適用されないため、ローカルコミットは安全です。",
         "commits_ahead_other": "{{count}} コミット先行",

@@ -15,6 +15,8 @@ const {
 } = require("./global-hotkey");
 const { initAutoUpdate } = require("./auto-update");
 const { makeUpdaterLogger } = require("./update-logger");
+const { createAppUpdateBridge } = require("./app-update-bridge");
+const { createUpdateApproval } = require("./update-approval");
 const { detectWsl2 } = require("./wsl-detection");
 const { crashNoticeSummary } = require("./crash-collector");
 const { PREFIX: PANE_ASSETS_PREFIX, purgeableOrigin } = require("./pane-asset-journal");
@@ -40,6 +42,17 @@ function createIpcRegistrar({
   // companion being wired.
   closeCrewCompanionForUpdate = () => {},
   reopenCrewCompanionAfterUpdate = () => {},
+  // The gateway's internal secret, re-read per call (it rotates across gateway
+  // restarts). Defaults to none, which makes the app-update bridge poll with no
+  // credential and be refused -- the safe default for a caller that has not
+  // wired it up, since the feature degrades to "no agent-armed updates" rather
+  // than to an unauthenticated surface.
+  readInternalSecret = () => "",
+  // Is the gateway this shell talks to on THIS machine? Defaults false, which
+  // disables both the bridge poll and the in-app approval: a window attached to
+  // a remote gateway must neither push the local secret through the tunnel nor
+  // present a local nonce to a gateway it does not belong to.
+  isGatewayLocal = () => false,
 } = {}) {
   if (!electron) throw new Error("createIpcRegistrar: electron is required");
   if (!store) throw new Error("createIpcRegistrar: store is required");
@@ -63,6 +76,7 @@ function createIpcRegistrar({
   let shellRegistered = false;
   let updaterRegistered = false;
   let updater = null;
+  let appUpdateBridge = null;
 
   setGlobalHotkeyLogger(log);
   const summonDashboard = createSummonHandler({
@@ -567,6 +581,25 @@ function createIpcRegistrar({
       updater.check();
       return { ok: true, info: updaterInfo() };
     });
+    // ── Agent-armed update approval (#503) ──────────────────────────────
+    //
+    // An agent can ARM an update through the gateway; only a host identity can
+    // approve one. This process HAS that identity (it can read the
+    // trust-fenced nonce in the data home), so Settings > About can offer the
+    // human click that turns an armed request into an install -- the same
+    // authority as `kirocrew update approve`, reachable by a user who never
+    // opens a terminal. Both handlers refuse on a remote gateway: see
+    // update-approval.js for why crossing that seam is not approval at all.
+    const approval = createUpdateApproval({
+      fetchFn: (url, init) => fetch(url, init),
+      getGatewayUrl: () => backendUrl,
+      getSecret: () => readInternalSecret(),
+      isGatewayLocal,
+      log,
+    });
+    ipcMain.handle("update:armed-status", () => approval.armedStatus());
+    ipcMain.handle("update:approve-armed", () => approval.approveArmed());
+
     ipcMain.handle("update:set-auto-download", (_event, enabled) => {
       if (typeof enabled !== "boolean") {
         return { ok: false, error: `invalid value: ${typeof enabled}` };
@@ -575,6 +608,41 @@ function createIpcRegistrar({
       if (enabled) updater.check();
       return { ok: true, info: updaterInfo() };
     });
+
+    // The bridge itself: outbound-only polling, so no inbound control surface
+    // is added to the process that holds the dashboard session. It reports this
+    // updater's state (the gateway's only source for the packaged lane's
+    // available version) and drains install requests a human already approved.
+    //
+    // Started LAST, after every ipcMain registration: a disabled updater skips
+    // the poll, and an early return placed higher up would take a renderer
+    // bridge down with it.
+    if (updater.disabled) {
+      log("app-update bridge not started: updates are disabled on this install");
+    } else {
+      appUpdateBridge = createAppUpdateBridge({
+        fetchFn: (url, init) => fetch(url, init),
+        getGatewayUrl: () => backendUrl,
+        getSecret: () => readInternalSecret(),
+        isGatewayLocal,
+        getUpdaterState: () => (
+          typeof updater.bridgeState === "function"
+            ? updater.bridgeState()
+            : { version: app.getVersion(), available_version: "", channel: "" }
+        ),
+        installApproved: async (request) => {
+          log(`app-update bridge: installing approved v${request.version}`);
+          if (typeof updater.installApproved !== "function") {
+            throw new Error("this updater build has no approved-install path");
+          }
+          return updater.installApproved(request);
+        },
+        onError: (err, ctx) => log(
+          `app-update bridge ${(ctx && ctx.phase) || "?"}: ${(err && err.message) || err}`,
+        ),
+      });
+      appUpdateBridge.start();
+    }
 
     updaterRegistered = true;
     return updater;
@@ -586,6 +654,12 @@ function createIpcRegistrar({
     unregisterGlobalHotkey,
     registerUpdater,
     summonDashboard,
+    /** Stop the app-update bridge poll. For shutdown and for tests. */
+    stopAppUpdateBridge: async () => {
+      const bridge = appUpdateBridge;
+      appUpdateBridge = null;
+      if (bridge) await bridge.stop();
+    },
   });
 }
 

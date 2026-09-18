@@ -12975,6 +12975,12 @@
         "copy_failed_select_the_link_and_copy_it_manually": "কপি ব্যর্থ হয়েছে। লিংকটি নির্বাচন করে নিজে কপি করুন।"
       },
       "aboutPanel": {
+        "agent_armed_expires_in": "এই অনুরোধটি {{time}} পরে শেষ হয়ে যাবে",
+        "agent_armed_failed": "আপডেট শুরু করা যায়নি",
+        "agent_armed_install": "ইনস্টল করে রিস্টার্ট করুন",
+        "agent_armed_installing": "ইনস্টল হচ্ছে — অ্যাপটি নিজেই রিস্টার্ট হবে।",
+        "agent_armed_update_body": "v{{version}} ইনস্টল করবেন? আপনি নিশ্চিত করার আগে এই মেশিনে কিছুই বদলাবে না।",
+        "agent_armed_update_heading": "একটি এজেন্ট আপডেটের অনুরোধ করেছে",
         "diverged": "আলাদা হয়ে গেছে",
         "checkout_diverged_from_upstream": "এই চেকআউটটি তার আপস্ট্রিম থেকে আলাদা হয়ে গেছে ({{distance}})। আপডেট করতে rebase বা merge করুন — কিছুই স্বয়ংক্রিয়ভাবে প্রয়োগ হয় না, তাই আপনার লোকাল কমিটগুলি নিরাপদ।",
         "commits_ahead_one": "{{count}}টি কমিট এগিয়ে",

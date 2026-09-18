@@ -12793,6 +12793,12 @@
         "copy_failed_select_the_link_and_copy_it_manually": "复制失败。请选择该链接并手动复制。"
       },
       "aboutPanel": {
+        "agent_armed_expires_in": "该请求将在 {{time}} 后失效",
+        "agent_armed_failed": "无法开始更新",
+        "agent_armed_install": "安装并重启",
+        "agent_armed_installing": "正在安装 — 应用会自行重启。",
+        "agent_armed_update_body": "要安装 v{{version}} 吗？在你确认之前，这台机器不会有任何改动。",
+        "agent_armed_update_heading": "有代理请求更新",
         "diverged": "已分叉",
         "checkout_diverged_from_upstream": "此检出已与上游分叉（{{distance}}）。请用 rebase 或 merge 更新——不会自动应用任何更改，你的本地提交是安全的。",
         "commits_ahead_other": "领先 {{count}} 个提交",

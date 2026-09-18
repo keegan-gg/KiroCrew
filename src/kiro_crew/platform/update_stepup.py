@@ -45,6 +45,18 @@ from kiro_crew.platform_compat import make_owner_only_dir
 
 logger = logging.getLogger(__name__)
 
+#: Which updater owns replacing this install's bytes, and therefore which apply
+#: lane an approval drives. Mirrors ``update_capability.MANAGED_BY_*`` without
+#: importing it: this module is on the CLI's ``update approve`` path, where the
+#: capability derivation's git subprocess probe is dead weight.
+LANE_WHEEL = "kirocrew"
+LANE_ELECTRON = "electron"
+
+#: The lanes an arm may name. Anything else is refused at read time rather than
+#: carried: a lane this module cannot vouch for must not reach the dispatch that
+#: decides whose bytes get replaced.
+LANES = frozenset({LANE_WHEEL, LANE_ELECTRON})
+
 #: How long an armed request stays approvable. RFC OQ7 names ~10 minutes:
 #: long enough to switch to a terminal, short enough that a forgotten arm
 #: does not linger as a standing approval-in-waiting.
@@ -85,6 +97,13 @@ class PendingUpdate:
     version: str
     channel: str
     created_at: float
+    #: The apply lane this arm was recorded for. Defaults to the wheel lane,
+    #: which is the only lane that existed before the packaged-app lane was
+    #: added, so a record written by an older gateway reads as what it was.
+    #: NOT trusted on its own: ``api_update_approve`` re-derives the install's
+    #: shape and refuses a mismatch, so a stale or forged lane cannot route an
+    #: approval into an apply path that does not own this install's bytes.
+    managed_by: str = LANE_WHEEL
 
     @property
     def expires_in(self) -> int:
@@ -99,7 +118,13 @@ def pending_path() -> Path:
     return data_home() / "trust" / _PENDING_FILENAME
 
 
-def arm(version: str, channel: str, *, source: str = "dashboard") -> PendingUpdate:
+def arm(
+    version: str,
+    channel: str,
+    *,
+    source: str = "dashboard",
+    managed_by: str = LANE_WHEEL,
+) -> PendingUpdate:
     """Record a pending update request; return it (nonce included, for the FILE).
 
     The caller serving the SPA must never forward the nonce — hand the SPA
@@ -107,12 +132,15 @@ def arm(version: str, channel: str, *, source: str = "dashboard") -> PendingUpda
     with owner-only permissions, replacing any previous request: arming grants
     nothing by itself, so last-writer-wins needs no coordination.
     """
+    if managed_by not in LANES:
+        raise StepUpError(f"unknown update lane: {managed_by!r}")
     pending = PendingUpdate(
         request_id=secrets.token_hex(8),
         nonce=secrets.token_hex(32),
         version=version,
         channel=channel,
         created_at=time.time(),
+        managed_by=managed_by,
     )
     path = pending_path()
     # Owner-only from BIRTH, not chmod-after-write: under umask 022 a plain
@@ -136,6 +164,7 @@ def arm(version: str, channel: str, *, source: str = "dashboard") -> PendingUpda
                         "version": pending.version,
                         "channel": pending.channel,
                         "created_at": pending.created_at,
+                        "managed_by": pending.managed_by,
                         "source": source,
                     }
                 )
@@ -149,10 +178,11 @@ def arm(version: str, channel: str, *, source: str = "dashboard") -> PendingUpda
             pass
         raise StepUpError(f"could not record the pending update request: {exc}") from exc
     logger.info(
-        "Armed update request %s (v%s, %s channel, from %s)",
+        "Armed update request %s (v%s, %s channel, %s lane, from %s)",
         pending.request_id,
         version,
         channel,
+        managed_by,
         source,
     )
     return pending
@@ -184,8 +214,17 @@ def read_pending(*, clear_expired: bool = False) -> PendingUpdate | None:
                 version=str(raw["version"]),
                 channel=str(raw["channel"]),
                 created_at=float(raw["created_at"]),
+                # Absent means a record an older gateway wrote, which could only
+                # ever have been the wheel lane. Present-but-unrecognised is a
+                # file this module cannot vouch for, so it reads as no armed
+                # request at all — the same fail-closed answer a malformed file
+                # gets below.
+                managed_by=str(raw.get("managed_by", LANE_WHEEL)),
             )
         except (KeyError, TypeError, ValueError):
+            return None
+        if pending.managed_by not in LANES:
+            logger.warning("Ignoring armed update request with unknown lane %r", pending.managed_by)
             return None
         if pending.expired:
             if clear_expired:
@@ -248,12 +287,20 @@ def public_view(pending: PendingUpdate) -> dict[str, object]:
         "request_id": pending.request_id,
         "version": pending.version,
         "channel": pending.channel,
+        # The lane, so a surface can offer the approval form its own host can
+        # actually perform: the packaged desktop app's About panel can read the
+        # nonce from disk itself (it IS the host), while a browser tab on a
+        # wheel install can only relay the command below.
+        "managed_by": pending.managed_by,
         "expires_in": pending.expires_in,
         "approve_command": "kirocrew update approve",
     }
 
 
 __all__ = [
+    "LANES",
+    "LANE_ELECTRON",
+    "LANE_WHEEL",
     "PENDING_TTL_SECS",
     "PendingUpdate",
     "StepUpError",

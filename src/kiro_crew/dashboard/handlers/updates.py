@@ -2474,25 +2474,120 @@ async def _audit_update_event(
     await asyncio.to_thread(_write)
 
 
+async def _arm_packaged_app(request: web.Request) -> web.Response:
+    """Arm an update for a packaged desktop install (dmg/appimage/deb/rpm).
+
+    Same privilege split as the wheel lane and for the same reason: arming is
+    an action an agent may take, approving is not. What differs is where the
+    two halves execute. The bytes belong to the Electron main process's
+    updater, so the gateway can neither name the available version nor perform
+    the swap — it holds a record and a queue, and the packaged host pulls from
+    both (see :mod:`kiro_crew.platform.app_update_bridge`).
+
+    The version therefore comes from the HOST's own report, never from the
+    caller: the CLI release feed this gateway reads describes a different
+    release stream, and letting an agent hand in a version would make the
+    armed record describe something no updater ever offered.
+    """
+    from kiro_crew.platform import update_stepup
+    from kiro_crew.platform.app_update_bridge import get_app_update_bridge
+
+    async def _audit(outcome: str, error: str = "", resources: str = "") -> None:
+        await _audit_update_event(
+            request,
+            operation="update.arm",
+            outcome=outcome,
+            error=error,
+            resources=resources,
+        )
+
+    # Policy first, exactly as on the wheel lane: a host whose updates are
+    # owned by a policy-defined command provider must not be handed a second,
+    # built-in mechanism that bypasses it.
+    if resolve_provider() is not None:
+        error = "updates on this host are managed by policy"
+        await _audit("denied", error=error)
+        return web.json_response(
+            {"error": error, "code": "arm_policy_managed", "governance": True},
+            status=409,
+        )
+    state = get_app_update_bridge().host_state()
+    if state is None:
+        # No desktop host is polling the bridge. Refusing is the honest answer
+        # rather than arming optimistically: an arm nothing can ever drain would
+        # sit there looking approvable, and the human who approved it would get
+        # a success response followed by nothing happening at all.
+        error = "the desktop app is not reachable — open the app and try again"
+        await _audit("denied", error=error)
+        return web.json_response({"error": error, "code": "arm_no_app_host"}, status=409)
+    version = state.available_version
+    channel = state.channel
+    if not version:
+        error = "the desktop app has not found an update — check for updates first"
+        await _audit("denied", error=error)
+        return web.json_response({"error": error, "code": "arm_no_verdict"}, status=409)
+    if _downgrade_target_below_min_version(version, channel):
+        error = "selected release is below the required minimum version"
+        await _audit("denied", error=error, resources=f"v{version} ({channel})")
+        return web.json_response(
+            {
+                "error": error,
+                "code": "arm_below_min_version",
+                "governance": True,
+            },
+            status=409,
+        )
+    try:
+        pending = await asyncio.to_thread(
+            update_stepup.arm,
+            version,
+            channel,
+            source="dashboard",
+            managed_by=update_stepup.LANE_ELECTRON,
+        )
+    except update_stepup.StepUpError as exc:
+        await _audit("failed", error=str(exc))
+        return web.json_response({"error": str(exc), "code": "arm_failed"}, status=500)
+    await _audit("granted", resources=f"v{version} ({channel}, app lane)")
+    return web.json_response({"ok": True, **update_stepup.public_view(pending)})
+
+
 async def api_update_arm(request: web.Request) -> web.Response:
     """POST /api/update/arm — arm a pending in-app update (SPA-callable).
 
     Arming grants nothing: it records the request and writes the approval
     nonce to a file only the host can read. The response NEVER carries the
-    nonce. Refused for every shape except the managed venv, when a downgrade
-    would cross below the active minimum-version floor, and when neither a
-    newer update nor a pending channel move is cached — an arm must name the
-    version the check reported, not whatever the feed happens to serve later (the apply
-    re-verifies against the signed manifest anyway).
+    nonce. Refused for every shape except the managed venv and a packaged
+    desktop install, when a downgrade would cross below the active
+    minimum-version floor, and when neither a newer update nor a pending
+    channel move is cached — an arm must name the version the check reported,
+    not whatever the feed happens to serve later (the apply re-verifies against
+    the signed manifest anyway).
+
+    Which lane the arm records is derived from the INSTALL SHAPE, through the
+    one derivation every update surface shares, rather than from anything the
+    caller says. A packaged install's approval drives the desktop app's own
+    updater; a managed venv's drives the shadow wheel apply. Approve re-derives
+    the same answer and refuses a mismatch, so an arm cannot outlive the shape
+    it was recorded for.
     """
     # Function-local: boot-path rule, same as _restart_gateway's import.
     from kiro_crew.platform import update_stepup
+    from kiro_crew.platform.update_capability import MANAGED_BY_ELECTRON, derive_capability
     from kiro_crew.platform.wheel_engine import running_from_managed_venv
+
+    # Offloaded: the derivation shells out to git and touches disk.
+    capability = await asyncio.to_thread(derive_capability)
+    if capability.managed_by == MANAGED_BY_ELECTRON:
+        return await _arm_packaged_app(request)
 
     if not await asyncio.to_thread(running_from_managed_venv):
         return web.json_response(
             {
-                "error": "in-app update applies only to the cli.sh managed-venv install",
+                "error": (
+                    "in-app update applies only to the cli.sh managed-venv install "
+                    "and the packaged desktop app"
+                ),
                 "code": "arm_wrong_shape",
             },
             status=409,
@@ -2541,6 +2636,73 @@ async def api_update_arm(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, **update_stepup.public_view(pending)})
 
 
+async def api_update_app_bridge(request: web.Request) -> web.Response:
+    """POST /api/update/app-bridge — the packaged desktop host's poll.
+
+    ONE call does both halves of the bridge: the host reports what its updater
+    currently knows (so the arm endpoint can name a real target version) and
+    drains at most one approved install request.
+
+    Internal-secret only, and deliberately not on the cookie fall-through: the
+    caller is the Electron main process on this host, never a browser. A
+    dashboard bearer that could reach this would be able to forge an updater
+    state — which is the input the arm endpoint names its version from — and,
+    worse, could drain an approval the real host then never receives.
+
+    Responses: 200 ``{"ok": true, "install": {...} | null}``.
+    """
+    if request.get("internal_auth") is not True:
+        await _audit_update_event(
+            request,
+            operation="update.app_bridge",
+            outcome="denied",
+            error="internal-secret authentication required (cookie callers forbidden)",
+        )
+        return web.json_response({"error": "loopback only", "code": "loopback_only"}, status=403)
+    from kiro_crew.platform.app_update_bridge import get_app_update_bridge
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    reported = body.get("state")
+    if not isinstance(reported, dict):
+        return web.json_response(
+            {"error": "state must be an object", "code": "state_invalid"}, status=400
+        )
+
+    def _field(name: str) -> str:
+        value = reported.get(name)
+        # Length-capped: this is an unauthenticated-by-shape string that lands in
+        # a log line and an armed record, and a host that reports garbage must
+        # not be able to grow either without bound.
+        return str(value)[:128] if isinstance(value, str) else ""
+
+    bridge = get_app_update_bridge()
+    bridge.report_state(
+        version=_field("version"),
+        available_version=_field("available_version"),
+        channel=_field("channel"),
+    )
+    install = bridge.take_install()
+    return web.json_response(
+        {
+            "ok": True,
+            "install": (
+                None
+                if install is None
+                else {
+                    "request_id": install.request_id,
+                    "version": install.version,
+                    "channel": install.channel,
+                }
+            ),
+        }
+    )
+
+
 async def api_update_arm_status(request: web.Request) -> web.Response:
     """GET /api/update/arm — the armed request, SPA-safe projection."""
     from kiro_crew.platform import update_stepup
@@ -2554,12 +2716,25 @@ async def api_update_arm_status(request: web.Request) -> web.Response:
 
 
 async def api_update_approve(request: web.Request) -> web.Response:
-    """POST /api/update/approve — consume the nonce and run the shadow apply.
+    """POST /api/update/approve — consume the nonce and drive the armed lane.
 
-    Called by ``kirocrew update approve`` on the gateway host, which read the
-    nonce from the data home. On success the apply runs as a background task:
-    shadow build + verify + promote (all off-loop), then the shared gateway
-    restart, with progress on the same SSE feed the git apply uses.
+    Called by ``kirocrew update approve`` on the gateway host, or by the
+    packaged desktop app's own About panel, both of which read the nonce from
+    the data home. Reading it is the host-identity proof; a remote dashboard
+    bearer cannot perform it, which is the whole point of the split.
+
+    Two lanes follow. A managed-venv install runs the shadow apply here as a
+    background task: shadow build + verify + promote (all off-loop), then the
+    shared gateway restart, with progress on the same SSE feed the git apply
+    uses. A packaged desktop install cannot be applied by this process at all,
+    so the approval is queued on the app-update bridge and the desktop host
+    pulls it on its next poll, driving its own updater through the graceful
+    stop-gateway handoff it already implements.
+
+    The lane is re-derived from the install shape here and must MATCH the armed
+    record. An arm is a statement about the install as it was; if the shape
+    changed underneath it, the safe answer is to refuse rather than to route an
+    approval into an apply path that does not own this install's bytes.
     """
     if not _loopback_peer(request):
         return web.json_response(
@@ -2579,12 +2754,25 @@ async def api_update_approve(request: web.Request) -> web.Response:
         )
     # Function-local: boot-path rule, same as the other update handlers.
     from kiro_crew.platform import update_stepup
+    from kiro_crew.platform.app_update_bridge import get_app_update_bridge
+    from kiro_crew.platform.update_capability import MANAGED_BY_ELECTRON, derive_capability
     from kiro_crew.platform.update_layout import cdn_bases as _cdn
     from kiro_crew.platform.update_layout import cdn_bases_are_safe as _cdn_safe
     from kiro_crew.platform.wheel_engine import (
         WheelUpdateError,
         apply_wheel_update,
         respawn_executable,
+    )
+
+    # Derived BEFORE the nonce is consumed so the wheel-only source checks below
+    # are skipped on the packaged lane rather than refusing it for a CDN pin that
+    # governs a feed its updater never reads — and so a shape mismatch can be
+    # refused without burning the armed request.
+    capability = await asyncio.to_thread(derive_capability)
+    host_lane = (
+        update_stepup.LANE_ELECTRON
+        if capability.managed_by == MANAGED_BY_ELECTRON
+        else update_stepup.LANE_WHEEL
     )
 
     # A policy-defined command provider OWNS updates on this host, and its
@@ -2607,18 +2795,19 @@ async def api_update_approve(request: web.Request) -> web.Response:
     # Checked pre-consume so a policy-refused attempt leaves the armed request
     # intact rather than burning it on a request that could never proceed.
     feed_base, artifact_base = _cdn()
-    blocked = update_blocked_reason(feed_base) or update_blocked_reason(artifact_base)
-    if blocked:
-        logger.warning("In-app update approval refused by source pin: %s", blocked)
-        return web.json_response(
-            {"error": blocked, "code": "approve_blocked_by_policy", "governance": True},
-            status=403,
-        )
-    if not _cdn_safe():
-        return web.json_response(
-            {"error": "CDN base URL contains disallowed characters", "code": "approve_bad_cdn"},
-            status=409,
-        )
+    if host_lane == update_stepup.LANE_WHEEL:
+        blocked = update_blocked_reason(feed_base) or update_blocked_reason(artifact_base)
+        if blocked:
+            logger.warning("In-app update approval refused by source pin: %s", blocked)
+            return web.json_response(
+                {"error": blocked, "code": "approve_blocked_by_policy", "governance": True},
+                status=403,
+            )
+        if not _cdn_safe():
+            return web.json_response(
+                {"error": "CDN base URL contains disallowed characters", "code": "approve_bad_cdn"},
+                status=409,
+            )
 
     # SEL-audited at every verdict: an approval is a code-install
     # authorization, which is exactly the class of event the audit chain
@@ -2641,6 +2830,13 @@ async def api_update_approve(request: web.Request) -> web.Response:
     except update_stepup.StepUpError as exc:
         await _audit("denied", error=str(exc))
         return web.json_response({"error": str(exc), "code": "approve_refused"}, status=403)
+    if pending.managed_by != host_lane:
+        error = (
+            f"the armed request targets the {pending.managed_by} update lane but this "
+            f"install is now managed by {host_lane} — arm again"
+        )
+        await _audit("denied", error=error, resources=f"v{pending.version}")
+        return web.json_response({"error": error, "code": "approve_shape_changed"}, status=409)
     if _downgrade_target_below_min_version(pending.version, pending.channel):
         error = "selected release is below the required minimum version"
         await _audit(
@@ -2675,6 +2871,23 @@ async def api_update_approve(request: web.Request) -> web.Response:
         )
 
     state: DashboardState = request.app["state"]
+
+    if host_lane == update_stepup.LANE_ELECTRON:
+        # Nothing runs here. The desktop host owns the swap, so the approval
+        # becomes a queued request it drains on its next poll and then drives
+        # through its own updater: checkForUpdates -> update-downloaded ->
+        # the awaited stopGateway() + quitAndInstall path it already has.
+        get_app_update_bridge().request_install(
+            version=pending.version,
+            channel=pending.channel,
+            request_id=pending.request_id,
+        )
+        state.push_update_progress(
+            "installing",
+            f"The desktop app is installing v{pending.version} and will restart.",
+        )
+        return web.json_response({"ok": True, "status": "installing", "version": pending.version})
+
     loop = asyncio.get_running_loop()
 
     def _progress(msg: str) -> None:

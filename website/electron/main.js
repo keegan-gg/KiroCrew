@@ -390,6 +390,23 @@ const ipcRegistrar = createIpcRegistrar({
   closeCrewCompanionForUpdate,
   reopenCrewCompanionAfterUpdate,
   crashScan: scanCrashArtifacts,
+  readInternalSecret,
+  // Loopback is NOT sufficient on its own: a window can reach a remote crew
+  // over an SSH tunnel bound to 127.0.0.1, whose gateway is another machine's.
+  // The remote-host record for the port is what separates the two -- the same
+  // predicate the browser command channel's heartbeat uses.
+  isGatewayLocal: () => {
+    try {
+      const url = new URL(BACKEND_URL);
+      const loopback = url.hostname === "127.0.0.1"
+        || url.hostname === "localhost"
+        || url.hostname === "[::1]"
+        || url.hostname === "::1";
+      return loopback && !getRemoteHostConfig(store, Number(url.port) || PORT)?.host;
+    } catch {
+      return false;
+    }
+  },
 });
 
 /**

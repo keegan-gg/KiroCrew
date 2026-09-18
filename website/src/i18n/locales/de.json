@@ -12974,6 +12974,12 @@
         "copy_failed_select_the_link_and_copy_it_manually": "Kopieren fehlgeschlagen. Wählen Sie den Link aus und kopieren Sie ihn manuell."
       },
       "aboutPanel": {
+        "agent_armed_expires_in": "Diese Anfrage läuft in {{time}} ab",
+        "agent_armed_failed": "Update konnte nicht gestartet werden",
+        "agent_armed_install": "Installieren und neu starten",
+        "agent_armed_installing": "Wird installiert – die App startet von selbst neu.",
+        "agent_armed_update_body": "v{{version}} installieren? Auf diesem Gerät ändert sich nichts, bis Sie bestätigen.",
+        "agent_armed_update_heading": "Ein Agent hat ein Update angefordert",
         "diverged": "Abgewichen",
         "checkout_diverged_from_upstream": "Dieser Checkout ist vom Upstream abgewichen ({{distance}}). Zum Aktualisieren Rebase oder Merge ausführen — nichts wird automatisch angewendet, die lokalen Commits bleiben also erhalten.",
         "commits_ahead_one": "{{count}} Commit voraus",

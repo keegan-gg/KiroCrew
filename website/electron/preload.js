@@ -288,4 +288,11 @@ contextBridge.exposeInMainWorld("updateAPI", {
   // Auto-download opt-out (Settings > About). ON by default: a discovered
   // update downloads in the background and installs on the next quit.
   setAutoDownload: (enabled) => ipcRenderer.invoke("update:set-auto-download", enabled),
+  // Agent-armed update step-up (#503). `armedStatus` is the gateway's
+  // nonce-free projection of a pending arm; `approveArmed` is the human click
+  // that consumes it. The nonce itself never crosses this bridge -- the main
+  // process reads it from the data home, which is the host-identity proof the
+  // step-up is built on, and hands back only ok/version.
+  armedStatus: () => ipcRenderer.invoke("update:armed-status"),
+  approveArmed: () => ipcRenderer.invoke("update:approve-armed"),
 });

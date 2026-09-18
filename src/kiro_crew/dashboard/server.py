@@ -412,6 +412,13 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # boundary, and the handler re-asserts host-locality itself because a
         # local_only=False deployment reclassifies strict paths as mixed.
         "/api/update/approve",
+        # The packaged desktop app's update bridge. STRICT for the same reason
+        # as /api/browser/command-drain: its only legitimate caller is the
+        # Electron main process on this host presenting X-Internal-Secret. A
+        # browser bearer reaching it could forge the updater state the arm
+        # endpoint names its target version from, and could drain an approval
+        # the real host would then never receive.
+        "/api/update/app-bridge",
         # Dev Fleet pod lifecycle — the agent surface behind the ``pod_up`` /
         # ``pod_down`` / ``pod_status`` / ``pod_ls`` MCP tools. An agent session
         # runs behind a sandbox with its own user namespace, so its shells cannot

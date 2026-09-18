@@ -13337,6 +13337,12 @@
         "copy_failed_select_the_link_and_copy_it_manually": "Не удалось скопировать. Выдели ссылку и скопируй её вручную."
       },
       "aboutPanel": {
+        "agent_armed_expires_in": "Запрос истечёт через {{time}}",
+        "agent_armed_failed": "Не удалось запустить обновление",
+        "agent_armed_install": "Установить и перезапустить",
+        "agent_armed_installing": "Установка — приложение перезапустится само.",
+        "agent_armed_update_body": "Установить v{{version}}? На этом компьютере ничего не изменится, пока вы не подтвердите.",
+        "agent_armed_update_heading": "Агент запросил обновление",
         "diverged": "Расхождение",
         "checkout_diverged_from_upstream": "Эта рабочая копия разошлась с upstream ({{distance}}). Выполните rebase или merge, чтобы обновиться — ничего не применяется автоматически, поэтому ваши локальные коммиты в безопасности.",
         "commits_ahead_one": "{{count}} коммит впереди",

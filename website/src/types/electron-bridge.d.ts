@@ -241,6 +241,27 @@ declare global {
     getInfo?: () => Promise<(UpdateInfo & { lastState?: UpdateState | null }) | undefined>
     setChannel?: (channel: string) => Promise<UpdateResult>
     setAutoDownload?: (enabled: boolean) => Promise<UpdateResult>
+    /**
+     * The gateway's nonce-free projection of a pending agent-armed update, or
+     * `{ armed: false }`. Optional: an older shell has no such bridge, and the
+     * panel that reads it renders nothing rather than assuming one.
+     */
+    armedStatus?: () => Promise<{
+      armed: boolean
+      version?: string
+      channel?: string
+      managed_by?: string
+      expires_in?: number
+      request_id?: string
+      approve_command?: string
+      reason?: string
+    }>
+    /**
+     * The human click that turns an armed request into an install. The main
+     * process reads the approval nonce from the data home — that read IS the
+     * host-identity proof — and never hands it back here.
+     */
+    approveArmed?: () => Promise<{ ok: boolean; version?: string; error?: string }>
   }
 
   interface Window {
