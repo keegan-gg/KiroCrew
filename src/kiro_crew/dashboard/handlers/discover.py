@@ -23,6 +23,10 @@ from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel as _sel
 from kiro_crew.skill_providers.base import ProviderRegistry, SkillProvider, provider_available
+from kiro_crew.skill_providers.github import (
+    GitHubRepoConfig,
+    GitHubRepoProvider,
+)
 from kiro_crew.skill_providers.skillsh import SkillsShConfig, SkillsShProvider
 from kiro_crew.skills import skills_dir as _skills_dir
 
@@ -100,6 +104,16 @@ def _build_registry() -> ProviderRegistry:
     skillsh = SkillsShProvider(SkillsShConfig(enabled=True))
     if admits_registry("skill", skillsh.name, skillsh.api_base):
         registry.register(skillsh)
+
+    # GitHub repositories -- the user's own skills, addressed as
+    # ``owner/repo[@ref][:path]`` rather than searched, and imported pinned to the
+    # resolved commit. It is a built-in for the same reason skills.sh is: a
+    # provider registered here inherits the human-only install gate, the bundle
+    # writer's containment checks and the discovery policy, none of which an
+    # independent import path would.
+    github = GitHubRepoProvider(GitHubRepoConfig())
+    if admits_registry("skill", github.name, github.api_base):
+        registry.register(github)
 
     # Edition-contributed providers (CPP seam). Each passes through the same
     # discovery-policy gate as the built-in provider, so a managed allowlist
