@@ -187,12 +187,30 @@ never hand-roll a green result by filtering only check conclusions. Unknown or
 unmapped states fail closed. Mergeability can be asynchronous: `unknown`,
 `checking` or `unchecked` means wait, never pass; a closed object may never settle.
 Collapse superseded attempts to the newest per workflow/check identity when you
-read the rollup yourself and a start time orders the attempts; keep every row you
-cannot strictly order. A typed provider does not collapse: a display label cannot
-prove that two rows are one dispatch retried, so it keeps same-labelled rows
-independent and a `checks_failed` wake can name an attempt a newer run already
-replaced. On such a wake, resolve the newest run for that identity before treating
-the failure as live.
+read the rollup yourself, ordering by the RUN ID, which increases monotonically. Not by
+a job's start time, which waits on a runner queue, and not by the run's creation time,
+which resolves only to the second and is routinely shared by two runs of one workflow on
+one head; keep every row you cannot strictly order. A typed provider collapses the
+same way, keyed on the workflow DEFINITION's id plus the check name rather than on the
+display name, since two workflow files may share one `name:`, and on the run's
+triggering event, since one file on `push` and `pull_request` dispatches twice for one
+commit and neither run replaces the other. Within that identity the
+highest RUN ID wins, but recency alone does not license dropping a row: the rollup
+carries no lineage edge saying one run replaced another. Drop a row only when its own
+run was CANCELLED and a newer run of its identity exists -- cancellation by the
+concurrency group is what establishes displacement, and such a row carries no verdict
+to lose. A row that reached a conclusion is kept however old it is, so a replaced round
+that COMPLETED still shows its rows. Separately and in the other direction, the NEWEST
+run being cancelled is never a reason to drop it, since that revives the verdict of the
+run it superseded. Two rows of ONE run are not a retry and both stay, because a
+workflow can publish a check run under its own job's display name and both are live at
+once, so dropping either would hide a live failure. Note what
+the host leaves behind:
+any completed row of a replaced round still reads as live, not only a cancelled one.
+The bundled `pr_status.py` does NOT yet follow this rule: its `collapse_superseded`
+keys on the workflow's display name without the trigger and orders by the job's
+`startedAt`, and it discards the row it displaces, so read its output knowing it can
+drop a live failure where the typed provider keeps one. Issue #11832 tracks it.
 
 Green checks do not answer review threads or advisory findings. Establish once
 per repo what its reviewer check means, and repeat when its fleet changes:
