@@ -290,9 +290,9 @@ Every job here is blocking. Every job that costs real runner time also `needs:`
 | `changes` | "Detect changed surface". Resolves the path filters every other job reads, so a diff that cannot affect a surface does not pay for it |
 | `await-fast-gate` | Polls the `Fast Gate` run for this exact head commit and **fails closed** in all three ways it can go wrong: a run that never appears (180s budget), one that never completes (720s budget), and one that completes non-success. A barrier that passed when it could not read its subject would be worse than none, because the matrix would run anyway and the log would claim it was cleared to. One extra ~1-minute job buys the whole matrix the right to not start |
 | `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink — and `scripts/check_subprocess_encoding.py` (self-test first) — no text-mode subprocess call without an explicit `encoding=`, `**UTF8_TEXT`, or a `# subprocess-encoding: locale` marker, outside `.github/subprocess-encoding-baseline.txt`, which can only shrink — and `scripts/check_sync_io_in_async.py` (self-test first) — no blocking db / subprocess / http / `time.sleep` call inside an `async def` under `src/`, outside `.github/sync-io-in-async-baseline.txt`, which can only shrink. A stall past `dashboard.loop_stall_exit_after_secs` (25s) makes the watchdog kill the gateway and drop every in-flight turn (#3057, #1572); the escape is an offload (`await asyncio.to_thread(...)`, or a named lane from `src/kiro_crew/executors.py`) or a `# on-loop-io-ok: <why it cannot block>` marker whose reason is mandatory. All four baselined gates in this job read their diff scope from the one shared resolver in `scripts/ratchet_scope.py`, so they cannot disagree about which lines a change added; the env-base gates (`check_brand_name.py`, `check_harness_parity.py`, `check_focus_cue.py`) share the same diff parsing through its explicit-base entry points while keeping their `*_BASE_REF` base semantics |
-| `backend-test` | 8 whole-file shards on Python 3.12, assigned before import, `-n auto` within each; 60-minute job budget includes coverage upload, with the 120-second per-test timeout retained. Shard 1 runs on the **CodeBuild-hosted runner** behind the `run-as-runner` non-root boundary (canary; the other shards stay `ubuntu-latest` until it is green three runs in a row — pilot, below) |
-| `backend-test-windows` | windows-latest, 8 whole-file shards assigned before import, `--no-cov`, 180s per-test timeout. The backend supports Windows natively via `platform_compat`, and nothing else in CI holds that line |
-| `backend-test-windows-fail-closed` | windows-latest, single `-n0` run of `test/test_windows_fail_closed_optin.py` BY NODE ID with the pass count grepped, so a silent skip cannot go green. It is the only lane that boots a real gateway and drives one ACP prompt turn on Windows, against real filesystem state instead of a `sys.platform` mock: the pair of assertions [PR #8117](https://github.com/kirodotdev/KiroCrew/pull/8117) broke and no test could see |
+| `backend-test` | 8 whole-file shards on Python 3.12, assigned before import, `-n auto` within each; 60-minute job budget includes coverage upload, with the 120-second per-test timeout retained. Large CodeBuild compute with the non-root boundary for eligible actors; hosted fallback |
+| `backend-test-windows` | All 8 whole-file shards use large CodeBuild compute for eligible actors, windows-latest otherwise; `--no-cov`, 180s per-test timeout. See the migration contract below |
+| `backend-test-windows-fail-closed` | Same actor-gated Windows routing, single `-n0` run of `test/test_windows_fail_closed_optin.py` BY NODE ID with the pass count grepped, so a silent skip cannot go green. It boots a real gateway and drives one ACP prompt turn on Windows against real filesystem state |
 | `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs all eleven sandbox-dependent suites. The shards collect the same files — nothing is deselected — but there the sandbox-guarded tests skip, so this is the only lane where those 85 assertions (the `~/.kiro/crew` keystone among them) actually execute |
 | `backend-test-crew-container` | "Backend Tests (crew container)". The only lane that runs the crew container image's suite (`aws_control/crew/runtime/container_tests/`, 327 tests). It is separate from the shards because it installs the image's own runtime pins (`container/requirements.txt`: fastapi, uvicorn, httpx, boto3), which that file's header forbids becoming dependencies of the application, and the shards' environment IS the application's, so there the suite's conftest collects nothing. Sets `CREW_CONTAINER_TESTS_REQUIRED=1`, which turns every reason that conftest would decline to collect into a hard error and checks the collection against the tree |
 | `coverage-combine` then `coverage-gate` | Combines the 3.12 shard data, then enforces the project line-rate floors, plus a per-file floor with a shrink-only baseline (all floors live in the job's `env:` block). **CodeBuild-hosted runner** (pilot, below) except for forks |
@@ -371,6 +371,81 @@ Rollback: replace the plugin and `--file-shards` / `--file-shard` flags in the
 three matrix invocations with the previous `--splits` / `--group` flags. No
 infrastructure, worker-count or privilege change is needed.
 
+### Linux and Windows CodeBuild migration
+
+All eight `backend-test` shards use `linux_runner_large`; all eight
+`backend-test-windows` shards and `backend-test-windows-fail-closed` use the
+centrally resolved large Windows label. `e2e-boot-matrix` maps its Linux and
+Windows legs to those outputs without changing `matrix.os`, names, timeouts or
+artifact names. `backend-lint` uses large plus `BLACK_NUM_WORKERS=4` on its
+Black step on both fleet and hosted runners; large alone did not resolve the
+measured Black process-pool failure. `bundle-size` uses large for its 6 GiB heap.
+Test arguments, shard ownership, coverage selectors, floors and skip lists stay
+unchanged. This is one migration being validated, not eight already-proven shards
+or a rollout conditional on three green canaries.
+
+The CI workflow requires this repository, a push or same-repository PR, and
+`contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id)`.
+The same actor check covers the existing inline routes, including every
+unconditional Fast Gate. Pages and the main ratchet audit also admit manual
+runs from listed actors. The three non-agentic code-review checks use the PR
+route; the merge-conflict label job and the reusable wheel/dependency-audit
+jobs use the fleet only for push events, keeping scheduled/manual callers hosted.
+Their steps, permissions and triggers are unchanged.
+
+The repository variable is a JSON array of string actor IDs matching the fleet
+webhook filter. Missing/empty membership routes to hosted; a fork PR stays
+hosted even when its actor is admitted. Every output consumer has a hosted
+fallback. Removing the variable routes all these jobs back to hosted on new
+runs, without changing tests or AWS resources. It does not reroute an already
+queued job. The independent webhook filter remains necessary: routing is not a
+credential boundary against a contributor who edits a workflow.
+
+The existing projects were reported verified with Linux `standard:7.0` and
+Windows `windows-base:2022-1.0`, MEDIUM defaults, no project environment
+variables, privileged mode off, no reserved fleet, and matching actor filters.
+The Windows label adds only `instance-size:large`; it invents no image override.
+These manually managed resources still need reproducible infrastructure source;
+this repository change grants no AWS permissions and provisions no resources.
+
+Linux setup actions retain the runner identity. `run-as-runner` then hands only
+the workspace to the test user and supplies jq 1.7.1, lsof and toolcache libpython
+resolution. The root-owned runner temp is sticky 1777, never recursively chowned;
+file-command files remain unwritable by the test user. Tests and shard coverage
+staging use ci-shell; scope selection keeps the default shell because it writes
+`GITHUB_OUTPUT`. Hosted uses a bash passthrough. The boot matrix uses the same
+boundary on Linux, where its rich fixture asserts a named namespace refusal
+when the real backend is unavailable rather than skipping the test.
+
+Windows checkout is followed by a CodeBuild-only inventory using system
+PowerShell, before setup-python/setup-uv and default-pwsh run steps. It reports
+installed shells/tools, memory and selected paths, verifies installed pwsh and
+native Git Bash (not the System32 WSL launcher), and does not install packages.
+After dependency setup, hard probes require Python 3.12, Git, uv, jq and Node
+at the supported floor, exact token-user file ownership, owner-only ACL
+application, file symlinks, rename and cleanup under workspace and runner temp.
+Owner errors include both SIDs. gh is not required because backend tests stub
+its calls. Probes touch only disposable files and log no environment dump or
+credentials. Hosted setup and test behavior is unchanged.
+
+The reusable Linux boundary has one eight-way shard measurement:
+[run 35374412954, job 105696454897](https://github.com/kirodotdev/KiroCrew/actions/runs/35374412954/job/105696454897)
+reports 12,998 passed, 42 skipped and 5 xfailed in 473.89 seconds. It does not prove
+all eight shards, Windows image capabilities, Black with the new worker cap, or
+service cleanup. Retain each newly executed job's log/progress artifact, compare
+counts against its hosted population, verify coverage combine/gate, and confirm
+build termination and runner deregistration. Linux local tests cannot establish
+native Windows or CodeBuild lifecycle facts. Task Scheduler pod boot, interactive
+installer, namespace E2E/sandbox, release and GUI jobs remain outside this migration
+pending real container proof or infrastructure approval.
+
+Rollback needs no AWS change: set Linux resolver outputs to `ubuntu-latest` and
+Windows to `windows-latest`, and return the two direct routes (`changes` and
+`await-fast-gate`) to hosted; an individual consumer can instead use its hosted
+label. Boot-matrix rollback restores `runs-on: ${{ matrix.os }}`. Keep the test
+arguments and coverage unchanged. A rejected webhook leaves a job queued before
+its timeout starts; diagnose or roll back rather than raising that timeout.
+
 ### macOS is not a pull-request gate any more
 
 The macOS pytest lane ran in this table until the queue was measured. On three
@@ -406,8 +481,8 @@ Details worth knowing:
   30-second job for 13 minutes (measured 2026-09-11 on this job: mean queue 155 s,
   max 788 s, 6 of 29 runs over five minutes), and the repository is ~99% of the
   org's Actions consumption, so the wait is a fair-use ceiling no workflow change
-  can lift. The runner infrastructure (project, role, webhook filters) is
-  modelled in the maintainers' internal `KiroCrewPublishCDK` package, not here.
+  can lift. Reproducible source for the deployed runner infrastructure remains
+  follow-up work; this public repository only selects existing projects.
   **Second wave:** `frontend-test` (4 shards), `frontend-coverage-merge`,
   `coverage-combine` and `coverage-gate` are routed the same way. The frontend
   shards add an `instance-size:large` label suffix (8 vCPU / 15 GB, the hosted
@@ -433,74 +508,13 @@ Details worth knowing:
   `scripts/`) gained coverage numbers of their own, which the per-file gate
   failed. `website/vite.config.ts` now excludes every non-`src/` directory of
   `website/` by name, anchored on `website/`, which is a no-op on hosted paths.
-  **`backend-test` runs behind a non-root boundary, one shard at a time.**
-  The first pilot run routed its four shards to CodeBuild large and each failed
-  37–42 tests (25k passed), because the CodeBuild runner executes the job as
-  root — this suite asserts permission semantics (read-only refusals,
-  root-owned-ancestor checks, `PermissionError`) that root does not have, and
-  the code refuses to run providers as root by design — and because the
-  `standard:7.0` image lacks parts of the hosted toolchain (jq 1.6 where the
-  repo's jq programs need 1.7, no `lsof`, and a setup-python toolcache whose
-  libpython needs `LD_LIBRARY_PATH`, which this suite deliberately strips when
-  it spawns a sanitized subprocess). AWS documents no non-root mode for the
-  CodeBuild GitHub Actions runner, and a custom image was assumed to be the
-  prerequisite. It is not: `.github/actions/run-as-runner` closes all of it
-  inside the job. The runner process and the `setup-*` actions stay root; the
-  action then creates an unprivileged `runner` user, hands it the workspace
-  (`chown`, never `chmod 777`) and gives the job temp `/tmp` semantics —
-  root-owned, world-writable, **sticky** — rather than chowning it: that
-  directory holds the runner's file-command directory (`$GITHUB_ENV` and
-  siblings, which the runner process applies **as root** to the NEXT step) and
-  the checkout's transient git credentials config, and sticky is what stops a
-  non-owner renaming an entry it does not own. Then it registers the toolcache lib
-  dirs with `ldconfig`, installs the two missing tools, and installs
-  `/usr/local/bin/ci-shell` — a `shell:` program the steps that must not be root
-  declare as their shell. On `ubuntu-latest` ci-shell is a bash passthrough and
-  the action changes nothing, so one workflow expression serves both runners.
-  Measured on the spike (run 34717454028, one shard of four): 25,224 passed / 77
-  skipped / 4 failed — not one of the four a root-semantic failure (missing
-  `lsof`; a 1.6013 s reading against a 1.6000 s latency bound; two eager-session
-  scheduling assertions). Measured again on the shard this file now routes (job
-  105495676140, when the matrix stood at eight): `uid=1002(runner)`,
-  `HOME=/home/runner`, workspace `runner:runner`, `$RUNNER_TEMP` `root:root` and
-  sticky, the file-command directory not writable, jq 1.7.1 and lsof 4.93.2
-  present, libpython resolving without `LD_LIBRARY_PATH`, `unshare NEWNS`
-  refused — and **14,248 passed / 54 skipped / 0 failed** in 38 min, coverage
-  written and uploaded by the unprivileged process. Repeated three more times
-  while the matrix stood at four (jobs 105528057411, 105537187805, 105555046095):
-  **28,606 / 28,635 / 28,636 passed, 97 skipped, 0 failed**, 23–24 min each, the
-  same identity assertions passing every time. Per-shard counts move with the
-  shard count, so read them as repeatability evidence, not as a target.
-  The spike's three timing
-  residuals did not recur and were not touched. Peak-hour measurement behind the
-  original move (2026-09-11, 38 runs): backend shards queued p90 521 s / max
-  763 s, frontend shards p90 569 s / max 813 s, with 103 of these jobs running
-  at once. Things to know when touching it:
-  - **Only shard 1 is routed, on purpose.** `runs-on` reads
-    `${{ matrix.group == 1 && needs.changes.outputs.linux_runner_large || 'ubuntu-latest' }}`,
-    so shards 2–8 stay hosted and act as controls while also exercising the
-    passthrough. The remaining shards move only after the canary is green on
-    three consecutive runs including one rerun, with coverage uploaded by the
-    unprivileged process each time.
-  - **The boundary is asserted, not assumed.** A CodeBuild-only step asserts
-    `id -u != 0`, `HOME=/home/runner`, a writable workspace, a job temp that is
-    writable but root-owned and sticky, a NOT-writable file-command directory,
-    and a present `lsof` before any test runs, and
-    `test/test_ci_nonroot_boundary.py` pins the workflow half: the action is
-    invoked, it comes after the `setup-*` actions and before every step that
-    declares `shell: /usr/local/bin/ci-shell {0}`, the action grants no sudoers
-    rule and makes nothing world-writable, and every download it performs is
-    sha256-pinned. A step that silently loses its `shell:` runs as root again,
-    which reappears as dozens of permission failures nobody reads as a routing
-    bug — that is what these pins exist to name.
-  - **The namespace jobs are a different problem and stay hosted.**
-    `unshare --mount --map-root-user true` returns `Operation not permitted` on
-    this CodeBuild project, so dropping privilege buys `backend-test-sandbox`,
-    `e2e`, `release-candidate-tests` and `gui-user-test` nothing: they verify a
-    real user namespace, and routing them would turn an enforcement check into a
-    skip. Moving them needs its own compute (a deliberately reviewed privileged
-    CodeBuild configuration, or an ephemeral EC2 runner with unprivileged user
-    namespaces), evaluated separately.
+  **Backend shards also use large compute**, with the in-job non-root boundary
+  described in [Linux and Windows CodeBuild migration](#linux-and-windows-codebuild-migration).
+  Root semantics and the measured jq/lsof/libpython gaps are handled there;
+  namespace enforcement jobs still require their hosted kernel capabilities.
+  Peak-hour measurement behind the move (2026-09-11, 38 runs):
+  backend shards queued p90 521 s / max 763 s, frontend shards p90 569 s / max
+  813 s, with 103 of these jobs running at once. Things to know when touching it:
   - **Forks never see it.** The label is computed once, in the `changes` job
     (outputs `linux_runner` and `linux_runner_large`), and the routed jobs read
     it as `runs-on: ${{ needs.changes.outputs.linux_runner || 'ubuntu-latest' }}`,
@@ -510,7 +524,9 @@ Details worth knowing:
     checks execute: a run in any
     repository other than `kirodotdev/KiroCrew` (a fork's own CI on its `main`),
     or a `pull_request` whose head repository is not this one, gets
-    `ubuntu-latest`; everything else gets the CodeBuild label. The webhook on the AWS side is
+    `ubuntu-latest`; every other run still needs the event and actor checks
+    in [the migration contract](#linux-and-windows-codebuild-migration) before
+    receiving the CodeBuild label. The webhook on the AWS side is
     additionally filtered to runs triggered by accounts that can push to this
     repository (plus dependabot), so a fork PR that rewrites its workflow to force
     the label never starts a build — its job simply never gets a runner. The
@@ -680,10 +696,10 @@ Details worth knowing:
     set rather than gating a further expansion. Keep the routing only if the
     median queue-to-start on CodeBuild stays under 60 s and no routed job waits
     longer than the hosted baseline's mean (155 s) for a runner; otherwise roll
-    it back. The remaining `ubuntu-latest` jobs (`backend-test`, `changes`, the
-    lint jobs, `electron-test`, `bundle-size`, `linux-packaging`) stay where
-    they are until that window closes. Either way the outcome is recorded here so this entry
-    does not become a permanent one-off.
+    it back. This queue criterion measures routed jobs; it is not a prerequisite
+    for the full Linux/Windows migration described above. Namespace-dependent
+    jobs, Task Scheduler pod boot and Linux packaging retain hosted runners.
+    Record the measured outcome so this entry does not become a permanent one-off.
 
 - **The macOS peer-identity canary is asserted by name.** `pytest -q` does not name
   passing tests and a skip exits 0, so a canary that quietly stopped running (a
