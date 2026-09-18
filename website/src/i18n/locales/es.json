@@ -6755,7 +6755,12 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "El prompt o la tarea que se envía al agente cuando se dispara este trabajo",
       "timezone": "Zona horaria",
       "weekly_schedule": "Programación semanal",
-      "which_agent_handles_this_job_leave_default_for_t": "Qué agente se encarga de este trabajo. Deja el valor predeterminado para el agente principal."
+      "which_agent_handles_this_job_leave_default_for_t": "Qué agente se encarga de este trabajo. Deja el valor predeterminado para el agente principal.",
+      "chat_folder": "Carpeta de chat",
+      "chat_folder_none": "No archivar las ejecuciones",
+      "chat_folder_description": "Archiva cada ejecución de esta tarea en una carpeta de la barra lateral del chat, para que la carpeta funcione como su historial. Las notificaciones y la entrega por Slack no cambian.",
+      "chat_folder_hidden_in_chat": "Desactiva «Ocultar en el chat» para usar esto. Las ejecuciones de una tarea oculta no crean ninguna sesión de chat, así que no hay nada que archivar.",
+      "chat_folder_list_unavailable": "No se pudieron cargar tus carpetas de chat. Vuelve a cargar la página para elegir una."
     },
     "jobLogsView": {
       "cancel": "Cancelar",

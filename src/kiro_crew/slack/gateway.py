@@ -118,6 +118,7 @@ from kiro_crew.dashboard.chat_runner import (
 from kiro_crew.dashboard.chat_utils import (
     CRON_NOTIFICATION_KIND,
     SUBAGENT_COMPLETION_KIND,
+    cron_slot_name,
     dashboard_slot_key,
     mint_options_token,
     remember_slack_options,
@@ -125,9 +126,11 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.cron_inject import (
     context_meter_reading,
+    cron_run_gets_tab,
+    cron_suppressed_run_gets_tab,
+    deliver_cron_run,
     ensure_cron_slot,
-    inject_cron_result_to_dashboard,
-    prefetch_cron_history,
+    prefetch_cron_run_history,
 )
 from kiro_crew.dashboard.handlers import MAX_PROMPT_BYTES
 from kiro_crew.dashboard.handlers.autonudge import (
@@ -5590,18 +5593,16 @@ class GatewayOrchestrator:
                             downstream_service="none",
                         )
                         # Still inject into dashboard slot even when Slack is suppressed
-                        if (
-                            self.dashboard_state
-                            and job.persistent_session
-                            and not job.hide_in_chat
-                            and self.dashboard_state.has_slot(f"cron-{job.id}")
+                        if self.dashboard_state and cron_suppressed_run_gets_tab(
+                            self.dashboard_state, job
                         ):
-                            inject_cron_result_to_dashboard(
+                            await deliver_cron_run(
                                 self.dashboard_state,
                                 job,
                                 result_text,
-                                history=await prefetch_cron_history(self.dashboard_state, job.id),
+                                history=await prefetch_cron_run_history(self.dashboard_state, job),
                                 context_reading=_ctx_reading,
+                                run_session_key=session_key,
                             )
                         return result_text
 
@@ -5615,18 +5616,16 @@ class GatewayOrchestrator:
                         downstream_service="none",
                     )
                     # Still inject into dashboard slot even when silent
-                    if (
-                        self.dashboard_state
-                        and job.persistent_session
-                        and not job.hide_in_chat
-                        and self.dashboard_state.has_slot(f"cron-{job.id}")
+                    if self.dashboard_state and cron_suppressed_run_gets_tab(
+                        self.dashboard_state, job
                     ):
-                        inject_cron_result_to_dashboard(
+                        await deliver_cron_run(
                             self.dashboard_state,
                             job,
                             result_text,
-                            history=await prefetch_cron_history(self.dashboard_state, job.id),
+                            history=await prefetch_cron_run_history(self.dashboard_state, job),
                             context_reading=_ctx_reading,
+                            run_session_key=session_key,
                         )
                     return result_text
 
@@ -5641,24 +5640,23 @@ class GatewayOrchestrator:
                     # intentionally empty for a hidden cron — it exists solely to feed a dashboard
                     # follow-up turn, which a no-slot cron never has. Do NOT rely on cron:{id} for
                     # hidden-cron result persistence; get_history() is the source of truth.
-                    # This is the only slot *creator* site (get_or_create_slot); the dedup/silent
-                    # paths above only re-inject into an already-existing slot via has_slot(), so
-                    # they self-no-op when hide_in_chat is True.
-                    if job.persistent_session and not job.hide_in_chat:
-                        history = (
-                            await asyncio.to_thread(
-                                self.dashboard_state.conversation_log.read_messages,
-                                f"cron:{job.id}",
-                            )
-                            if self.dashboard_state.conversation_log
-                            else []
-                        )
-                        inject_cron_result_to_dashboard(
+                    # For a PERSISTENT job this is the only slot *creator* site: the
+                    # dedup/silent paths above re-inject into an already-existing tab
+                    # only, so they self-no-op when hide_in_chat is True or the tab
+                    # was never made. A STATELESS job filing into a chat folder has
+                    # no job-wide tab for "already exists" to be true of, so all
+                    # three paths create its per-run tab -- see
+                    # cron_suppressed_run_gets_tab for why a suppressed run still
+                    # earns its place in that folder.
+                    if cron_run_gets_tab(job):
+                        history = await prefetch_cron_run_history(self.dashboard_state, job)
+                        await deliver_cron_run(
                             self.dashboard_state,
                             job,
                             result_text,
                             history=history,
                             context_reading=_ctx_reading,
+                            run_session_key=session_key,
                         )
                     redacted_for_dash, _ = redact_exfiltration_urls(result_text)
                     redacted_for_dash, _ = redact_credentials(redacted_for_dash)
@@ -5672,12 +5670,15 @@ class GatewayOrchestrator:
                     # CTA shows "Continue session" pointing at a slot no longer
                     # receiving results. Gating here forces the no-slot "View last
                     # result" CTA, which lazily rebuilds from CronHistoryStore.
-                    if (
-                        job.persistent_session
-                        and not job.hide_in_chat
-                        and self.dashboard_state.has_slot(f"cron-{job.id}")
-                    ):
-                        notify_meta["slot"] = f"cron-{job.id}"
+                    # The CTA must name the tab THIS run actually landed in: a
+                    # stateless job filing into a chat folder has no job-wide tab,
+                    # so keying the CTA on `cron-{id}` would either offer
+                    # "Continue session" for a tab that does not exist or fall
+                    # back to "View last result" while the run sits in a tab the
+                    # user could have been taken straight to.
+                    _cta_slot = cron_slot_name(session_key) if cron_run_gets_tab(job) else ""
+                    if _cta_slot and self.dashboard_state.has_slot(_cta_slot):
+                        notify_meta["slot"] = _cta_slot
                     self.dashboard_state.notify(
                         "cron",
                         f"Cron: {safe_name}",

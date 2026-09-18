@@ -6652,7 +6652,12 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "Der Prompt oder die Aufgabe, die an den Agenten gesendet wird, wenn dieser Job ausgelöst wird",
       "timezone": "Zeitzone",
       "weekly_schedule": "Wöchentlicher Zeitplan",
-      "which_agent_handles_this_job_leave_default_for_t": "Welcher Agent diesen Job bearbeitet. Für den primären Agenten auf Standard belassen."
+      "which_agent_handles_this_job_leave_default_for_t": "Welcher Agent diesen Job bearbeitet. Für den primären Agenten auf Standard belassen.",
+      "chat_folder": "Chat-Ordner",
+      "chat_folder_none": "Ausführungen nicht einsortieren",
+      "chat_folder_description": "Jede Ausführung dieses Auftrags in einem Ordner der Chat-Seitenleiste ablegen, damit der Ordner als Verlauf dieses Auftrags zu lesen ist. Benachrichtigungen und die Slack-Zustellung bleiben unverändert.",
+      "chat_folder_hidden_in_chat": "Schalte „Im Chat ausblenden“ aus, um das zu nutzen. Die Ausführungen eines ausgeblendeten Auftrags erhalten keine Chat-Sitzung, es gibt also nichts abzulegen.",
+      "chat_folder_list_unavailable": "Deine Chat-Ordner konnten nicht geladen werden. Lade die Seite neu, um einen auszuwählen."
     },
     "jobLogsView": {
       "cancel": "Abbrechen",

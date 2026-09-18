@@ -85,7 +85,7 @@ class TestApiCronToChat:
         job = _make_job()
         state = _make_state(jobs=[job])
         with patch(
-            "kiro_crew.dashboard.handlers.cron.inject_cron_result_to_dashboard"
+            "kiro_crew.dashboard.handlers.cron.deliver_cron_run"
         ) as mock_inject:
             async with TestClient(TestServer(_make_app(state))) as client:
                 resp = await client.post("/api/crons/abc123/to-chat")

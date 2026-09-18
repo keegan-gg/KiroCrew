@@ -464,7 +464,14 @@ class TestDashboardInjectionRoutesRunChat:
 
 
 class TestCronCallbackDashboardChat:
-    """_cron_callback must call inject_cron_result_to_dashboard when persistent_session=True and slot exists."""
+    """_cron_callback must call deliver_cron_run when persistent_session=True and slot exists.
+
+    ``deliver_cron_run`` is the ONE delivery chokepoint: it writes
+    the run into its tab and then files that tab into the job's configured chat
+    folder. These tests patch it because the question they ask is which runs reach
+    a dashboard tab at all, which is the gate in front of it -- unchanged for
+    every job shape here, none of which names a chat folder.
+    """
 
     def test_persistent_session_with_slot_calls_inject(self) -> None:
         gateway = _make_gateway()
@@ -472,12 +479,12 @@ class TestCronCallbackDashboardChat:
         gateway.dashboard_state.has_slot = MagicMock(return_value=True)
         job = _make_job(persistent_session=True)
         with patch(
-            "kiro_crew.slack.gateway.inject_cron_result_to_dashboard"
+            "kiro_crew.slack.gateway.deliver_cron_run"
         ) as mock_inject:
             _run_callback(gateway, job, stream_result="cron output")
             mock_inject.assert_called_once_with(
                 gateway.dashboard_state, job, "cron output", history=ANY,
-                context_reading=ANY,
+                context_reading=ANY, run_session_key=ANY,
             )
 
     def test_persistent_session_without_slot_still_injects(self) -> None:
@@ -486,12 +493,12 @@ class TestCronCallbackDashboardChat:
         gateway.dashboard_state.has_slot = MagicMock(return_value=False)
         job = _make_job(persistent_session=True)
         with patch(
-            "kiro_crew.slack.gateway.inject_cron_result_to_dashboard"
+            "kiro_crew.slack.gateway.deliver_cron_run"
         ) as mock_inject:
             _run_callback(gateway, job, stream_result="cron output")
             mock_inject.assert_called_once_with(
                 gateway.dashboard_state, job, "cron output", history=ANY,
-                context_reading=ANY,
+                context_reading=ANY, run_session_key=ANY,
             )
 
     def test_non_persistent_session_does_not_inject(self) -> None:
@@ -500,7 +507,7 @@ class TestCronCallbackDashboardChat:
         gateway.dashboard_state.has_slot = MagicMock(return_value=True)
         job = _make_job(persistent_session=False)
         with patch(
-            "kiro_crew.slack.gateway.inject_cron_result_to_dashboard"
+            "kiro_crew.slack.gateway.deliver_cron_run"
         ) as mock_inject:
             _run_callback(gateway, job, stream_result="cron output")
             mock_inject.assert_not_called()
@@ -514,7 +521,7 @@ class TestCronCallbackDashboardChat:
         # Simulate dedup: set last_posted_hash to match result
         job.last_posted_hash = ""  # first run posts normally
         with patch(
-            "kiro_crew.slack.gateway.inject_cron_result_to_dashboard"
+            "kiro_crew.slack.gateway.deliver_cron_run"
         ) as mock_inject:
             # First run — normal path
             _run_callback(gateway, job, stream_result="same result")
@@ -534,12 +541,12 @@ class TestCronCallbackDashboardChat:
         gateway.dashboard_state.has_slot = MagicMock(return_value=True)
         job = _make_job(persistent_session=True, silent=True)
         with patch(
-            "kiro_crew.slack.gateway.inject_cron_result_to_dashboard"
+            "kiro_crew.slack.gateway.deliver_cron_run"
         ) as mock_inject:
             _run_callback(gateway, job, stream_result="silent output")
             mock_inject.assert_called_once_with(
                 gateway.dashboard_state, job, "silent output", history=ANY,
-                context_reading=ANY,
+                context_reading=ANY, run_session_key=ANY,
             )
 
     def test_silent_cron_no_slot_does_not_inject(self) -> None:
@@ -548,7 +555,7 @@ class TestCronCallbackDashboardChat:
         gateway.dashboard_state.has_slot = MagicMock(return_value=False)
         job = _make_job(persistent_session=True, silent=True)
         with patch(
-            "kiro_crew.slack.gateway.inject_cron_result_to_dashboard"
+            "kiro_crew.slack.gateway.deliver_cron_run"
         ) as mock_inject:
             _run_callback(gateway, job, stream_result="silent output")
             mock_inject.assert_not_called()
@@ -563,7 +570,7 @@ class TestCronCallbackDashboardChat:
         gateway.dashboard_state.has_slot = MagicMock(return_value=False)
         job = _make_job(persistent_session=True, hide_in_chat=True)
         with patch(
-            "kiro_crew.slack.gateway.inject_cron_result_to_dashboard"
+            "kiro_crew.slack.gateway.deliver_cron_run"
         ) as mock_inject:
             _run_callback(gateway, job, stream_result="hidden output")
             mock_inject.assert_not_called()
@@ -576,12 +583,12 @@ class TestCronCallbackDashboardChat:
         gateway.dashboard_state.has_slot = MagicMock(return_value=False)
         job = _make_job(persistent_session=True, hide_in_chat=False)
         with patch(
-            "kiro_crew.slack.gateway.inject_cron_result_to_dashboard"
+            "kiro_crew.slack.gateway.deliver_cron_run"
         ) as mock_inject:
             _run_callback(gateway, job, stream_result="shown output")
             mock_inject.assert_called_once_with(
                 gateway.dashboard_state, job, "shown output", history=ANY,
-                context_reading=ANY,
+                context_reading=ANY, run_session_key=ANY,
             )
 
     def test_hide_in_chat_suppresses_inject_even_with_existing_slot(self) -> None:
@@ -592,7 +599,7 @@ class TestCronCallbackDashboardChat:
         gateway.dashboard_state.has_slot = MagicMock(return_value=True)
         job = _make_job(persistent_session=True, hide_in_chat=True)
         with patch(
-            "kiro_crew.slack.gateway.inject_cron_result_to_dashboard"
+            "kiro_crew.slack.gateway.deliver_cron_run"
         ) as mock_inject:
             _run_callback(gateway, job, stream_result="hidden output")
             mock_inject.assert_not_called()
@@ -604,7 +611,7 @@ class TestCronCallbackDashboardChat:
         gateway.dashboard_state.has_slot = MagicMock(return_value=True)
         job = _make_job(persistent_session=True, silent=True, hide_in_chat=True)
         with patch(
-            "kiro_crew.slack.gateway.inject_cron_result_to_dashboard"
+            "kiro_crew.slack.gateway.deliver_cron_run"
         ) as mock_inject:
             _run_callback(gateway, job, stream_result="silent hidden output")
             mock_inject.assert_not_called()
@@ -629,7 +636,7 @@ class TestCronCallbackDashboardChat:
         gateway = _make_gateway()
         gateway.dashboard_state.has_slot = MagicMock(return_value=True)
         job = _make_job(persistent_session=True, hide_in_chat=True)
-        with patch("kiro_crew.slack.gateway.inject_cron_result_to_dashboard"):
+        with patch("kiro_crew.slack.gateway.deliver_cron_run"):
             _run_callback(gateway, job, stream_result="hidden output")
         meta = self._result_notify_meta(gateway.dashboard_state.notify)
         assert "slot" not in meta
@@ -640,7 +647,7 @@ class TestCronCallbackDashboardChat:
         gateway = _make_gateway()
         gateway.dashboard_state.has_slot = MagicMock(return_value=True)
         job = _make_job(persistent_session=True, hide_in_chat=False)
-        with patch("kiro_crew.slack.gateway.inject_cron_result_to_dashboard"):
+        with patch("kiro_crew.slack.gateway.deliver_cron_run"):
             _run_callback(gateway, job, stream_result="shown output")
         meta = self._result_notify_meta(gateway.dashboard_state.notify)
         assert meta.get("slot") == "cron-j1"

@@ -89,6 +89,7 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     ("source_preset", MAX_SHORT_STRING),
     ("source_template_prompt", MAX_CRON_MESSAGE),
     ("folder_id", MAX_SHORT_STRING),
+    ("chat_folder_id", MAX_SHORT_STRING),
     ("session_key", MAX_SHORT_STRING),
     ("model", MAX_SHORT_STRING),
     ("command", 5000),
@@ -770,6 +771,27 @@ class CronJob:
     # benign (they self-heal on the job's next folder move).
     folder_id: str = ""
     model: str = ""  # per-job model override (canonical key or provider id); "" = inherit
+    # The CHAT (sidebar) folder every run of this job is filed into; "" = not
+    # filed, which is what every job predating the field keeps doing.
+    #
+    # Distinct from ``folder_id`` above, and the two are never interchangeable:
+    # ``folder_id`` groups the job's ROW on the Schedule page
+    # (``cron_folders.json``), while this names a folder in the chat sidebar's
+    # own tree (``folders.json``) and decides where the job's RUNS land. A job
+    # may carry either, both or neither, and one is never derived from the other.
+    #
+    # Filing SUPPLEMENTS delivery, never replaces it: a run with a chat folder
+    # still reaches its Slack DM, its dashboard notification and its origin
+    # session exactly as it did before.
+    #
+    # CONTRACT for consumers, matching ``folder_id``'s: an id that does not
+    # match a folder in ``folders.json`` MUST be treated as "not filed". A chat
+    # folder can be deleted while a job still names it, and a dangling id must
+    # cost the run its place in the sidebar and nothing else -- the run still
+    # delivers, its session lands unfiled, and the skip is recorded once (see
+    # ``cron_inject.file_cron_run_in_chat_folder``). A RENAME is a no-op: ids
+    # are stable, so the job follows the folder under its new name.
+    chat_folder_id: str = ""
     # Transient-retry telemetry for the LAST completed run. Both fields are
     # written in ONE place, `CronService._execute`, right after it stamps
     # `last_run_ts`: it reads the in-flight `_transient_attempts` counter the
@@ -1980,6 +2002,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         minimal_context=j.get("minimal_context", False),
         hide_in_chat=j.get("hide_in_chat", False),
         folder_id=_guard_str("folder_id"),
+        chat_folder_id=_guard_str("chat_folder_id"),
         model=_guard_str("model"),
         last_retry_count=_guard_num("last_retry_count", 0),
         last_retry_run_ts=_guard_num("last_retry_run_ts", 0.0),
@@ -2636,6 +2659,7 @@ class CronService:
         strict_schedule: bool = False,
         hide_in_chat: bool = False,
         folder_id: str = "",
+        chat_folder_id: str = "",
         command: str = "",
         script: str = "",
         agent_sequence: list[str] | None = None,
@@ -2696,6 +2720,7 @@ class CronService:
             strict_schedule=strict_schedule,
             hide_in_chat=hide_in_chat,
             folder_id=folder_id,
+            chat_folder_id=chat_folder_id,
             command=command,
             script=script,
             agent_sequence=agent_sequence,
@@ -2825,6 +2850,7 @@ class CronService:
         strict_schedule: bool = False,
         hide_in_chat: bool = False,
         folder_id: str = "",
+        chat_folder_id: str = "",
         command: str = "",
         script: str = "",
         agent_sequence: list[str] | None = None,
@@ -2882,6 +2908,7 @@ class CronService:
                 "member_id": member_id,
                 "created_by": created_by,
                 "folder_id": folder_id,
+                "chat_folder_id": chat_folder_id,
                 "session_key": session_key,
                 "model": model,
                 "command": command,
@@ -2947,6 +2974,7 @@ class CronService:
             strict_schedule=strict_schedule,
             hide_in_chat=hide_in_chat,
             folder_id=folder_id,
+            chat_folder_id=chat_folder_id,
             command=command,
             script=script,
             agent_sequence=list(agent_sequence) if agent_sequence else [],
@@ -2998,6 +3026,7 @@ class CronService:
         strict_schedule: bool = False,
         hide_in_chat: bool = False,
         folder_id: str = "",
+        chat_folder_id: str = "",
         command: str = "",
         script: str = "",
         agent_sequence: list[str] | None = None,
@@ -3048,6 +3077,7 @@ class CronService:
             strict_schedule=strict_schedule,
             hide_in_chat=hide_in_chat,
             folder_id=folder_id,
+            chat_folder_id=chat_folder_id,
             command=command,
             script=script,
             agent_sequence=agent_sequence,
@@ -3319,6 +3349,8 @@ class CronService:
                     job.hide_in_chat = bool(kwargs["hide_in_chat"])
                 if "folder_id" in kwargs:
                     job.folder_id = kwargs["folder_id"] or ""
+                if "chat_folder_id" in kwargs:
+                    job.chat_folder_id = kwargs["chat_folder_id"] or ""
                 if "model" in kwargs:
                     job.model = str(kwargs["model"] or "").strip()
                 if "secret_env" in kwargs and kwargs["secret_env"] is not None:
@@ -6121,6 +6153,7 @@ class CronService:
                     "minimal_context": j.minimal_context,
                     "hide_in_chat": j.hide_in_chat,
                     "folder_id": j.folder_id,
+                    "chat_folder_id": j.chat_folder_id,
                     "model": j.model,
                     "last_retry_count": j.last_retry_count,
                     "last_retry_run_ts": j.last_retry_run_ts,

@@ -6549,7 +6549,12 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "此任务触发时发送给代理的提示词或任务",
       "timezone": "时区",
       "weekly_schedule": "每周计划",
-      "which_agent_handles_this_job_leave_default_for_t": "由哪个代理处理此任务。保持默认则使用主代理。"
+      "which_agent_handles_this_job_leave_default_for_t": "由哪个代理处理此任务。保持默认则使用主代理。",
+      "chat_folder": "聊天文件夹",
+      "chat_folder_none": "不归档运行记录",
+      "chat_folder_description": "将此任务的每次运行归档到聊天侧边栏中某个文件夹，这样该文件夹就是此任务的历史记录。通知和 Slack 投递均不受影响。",
+      "chat_folder_hidden_in_chat": "请先关闭“在聊天中隐藏”。已隐藏任务的运行不会生成聊天会话，因此没有可归档的内容。",
+      "chat_folder_list_unavailable": "无法加载你的聊天文件夹。请重新加载后再选择。"
     },
     "jobLogsView": {
       "cancel": "取消",

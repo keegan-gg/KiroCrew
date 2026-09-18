@@ -6755,7 +6755,12 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "Il prompt o l'attività inviata all'agente quando questo job si attiva",
       "timezone": "Fuso orario",
       "weekly_schedule": "Pianificazione settimanale",
-      "which_agent_handles_this_job_leave_default_for_t": "Quale agente gestisce questo job. Lascia il valore predefinito per l'agente principale."
+      "which_agent_handles_this_job_leave_default_for_t": "Quale agente gestisce questo job. Lascia il valore predefinito per l'agente principale.",
+      "chat_folder": "Cartella della chat",
+      "chat_folder_none": "Non archiviare le esecuzioni",
+      "chat_folder_description": "Archivia ogni esecuzione di questa attività in una cartella della barra laterale della chat, così la cartella si legge come la cronologia dell'attività. Le notifiche e la consegna su Slack non cambiano.",
+      "chat_folder_hidden_in_chat": "Disattiva «Nascondi nella chat» per usare questa opzione. Le esecuzioni di un'attività nascosta non creano nessuna sessione di chat, quindi non c'è nulla da archiviare.",
+      "chat_folder_list_unavailable": "Non è stato possibile caricare le tue cartelle della chat. Ricarica la pagina per sceglierne una."
     },
     "jobLogsView": {
       "cancel": "Annulla",

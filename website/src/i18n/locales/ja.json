@@ -6549,7 +6549,12 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "このジョブが実行するときエージェントに送信されるプロンプトまたはタスク",
       "timezone": "タイムゾーン",
       "weekly_schedule": "週次スケジュール",
-      "which_agent_handles_this_job_leave_default_for_t": "このジョブを処理するエージェント。プライマリエージェントの場合はデフォルトのままにしてください。"
+      "which_agent_handles_this_job_leave_default_for_t": "このジョブを処理するエージェント。プライマリエージェントの場合はデフォルトのままにしてください。",
+      "chat_folder": "チャットフォルダー",
+      "chat_folder_none": "実行を振り分けない",
+      "chat_folder_description": "このジョブの実行ごとにチャットサイドバーのフォルダーへ振り分け、そのフォルダーをこのジョブの履歴として読めるようにします。通知と Slack への配信は変わりません。",
+      "chat_folder_hidden_in_chat": "これを使うには「チャットで非表示」をオフにしてください。非表示のジョブの実行にはチャットセッションが作られないため、振り分けるものがありません。",
+      "chat_folder_list_unavailable": "チャットフォルダーを読み込めませんでした。選ぶにはページを再読み込みしてください。"
     },
     "jobLogsView": {
       "cancel": "キャンセル",

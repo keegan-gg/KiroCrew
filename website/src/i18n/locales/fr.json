@@ -6755,7 +6755,12 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "Le prompt ou la consigne envoyé à l'agent lorsque cette tâche se déclenche",
       "timezone": "Fuseau horaire",
       "weekly_schedule": "Planification hebdomadaire",
-      "which_agent_handles_this_job_leave_default_for_t": "Quel agent traite cette tâche. Laissez la valeur par défaut pour l'agent principal."
+      "which_agent_handles_this_job_leave_default_for_t": "Quel agent traite cette tâche. Laissez la valeur par défaut pour l'agent principal.",
+      "chat_folder": "Dossier de discussion",
+      "chat_folder_none": "Ne pas classer les exécutions",
+      "chat_folder_description": "Classez chaque exécution de cette tâche dans un dossier de la barre latérale de discussion, afin que ce dossier serve d'historique. Les notifications et la diffusion Slack ne changent pas.",
+      "chat_folder_hidden_in_chat": "Désactivez « Masquer dans la discussion » pour utiliser cette option. Les exécutions d'une tâche masquée ne créent aucune session de discussion, il n'y a donc rien à classer.",
+      "chat_folder_list_unavailable": "Impossible de charger vos dossiers de discussion. Rechargez la page pour en choisir un."
     },
     "jobLogsView": {
       "cancel": "Annuler",

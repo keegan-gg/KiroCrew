@@ -647,6 +647,24 @@ def _history_key_for(slot_key: str) -> str:
     return f"dashboard:{slot_key}"
 
 
+def cron_slot_name(session_key: str) -> str:
+    """The slot key for the cron tab displaying *session_key*.
+
+    ONE spelling for both tab shapes a cron run can be shown in, so a caller
+    never has to know which it is holding:
+
+    * ``cron:<job_id>`` -> ``cron-<job_id>``, the job's single long-lived tab.
+    * ``cron:<job_id>:<run_id>`` -> ``cron-<job_id>-<run_id>``, the per-run tab
+      a stateless job files into its configured chat folder.
+
+    The colon-to-hyphen fold is not ``_normalize_slot_key``: that helper folds a
+    colon to an UNDERSCORE, which for ``cron:`` keys names a slot that has never
+    existed (see :func:`dashboard_slot_key`). Keeping the cron fold here means
+    the two cannot drift.
+    """
+    return "cron-" + session_key.removeprefix("cron:").replace(":", "-")
+
+
 def dashboard_slot_key(session_key: str) -> str:
     """The dashboard slot name displaying *session_key*, or ``""`` if none.
 
@@ -673,8 +691,19 @@ def dashboard_slot_key(session_key: str) -> str:
         # while the surface registry only ever holds the slot's linked key
         # (``cron:<job_id>``), so the surface gate is checked against both
         # spellings. Whichever matched, the displaying tab is the job's own.
+        #
+        # A per-run key that has a surface of its OWN is answered with its own
+        # tab, and that ordering is the load-bearing part: a stateless job filing
+        # each run into a chat folder mints ``cron-<job_id>-<run_id>`` and
+        # publishes the run key, so returning the job-wide tab here would route
+        # the run's cards and notices to a tab that may not even exist. A
+        # sequential-agent key (``cron:<job_id>:<agent>``) is unaffected -- only
+        # the job's linked key is ever published for it, so it falls through to
+        # the job-wide answer exactly as before.
         job_id = session_key.removeprefix("cron:").split(":", 1)[0]
-        if not (has_dashboard_surface(session_key) or has_dashboard_surface(f"cron:{job_id}")):
+        if has_dashboard_surface(session_key):
+            return _normalize_slot_key(cron_slot_name(session_key))
+        if not has_dashboard_surface(f"cron:{job_id}"):
             return ""
         return _normalize_slot_key(f"cron-{job_id}")
     if not has_dashboard_surface(session_key):

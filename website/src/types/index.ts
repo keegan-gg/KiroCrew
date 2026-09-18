@@ -437,6 +437,11 @@ export interface CronJob {
   secret_env_pending?: Record<string, string> | null
   secret_env_pending_ts?: number | null
   folder_id?: string
+  /** Sidebar chat folder every RUN of this job is filed into, or ""/absent for
+   *  a job whose runs are not filed. A different tree from `folder_id` directly
+   *  above, which groups this job's ROW on the Schedule page — the two are never
+   *  read off each other. */
+  chat_folder_id?: string
   /** Chat session that owns this job — ownership decides chat-side reachability
    * (cron_list only lists a session its own jobs). Null for an ownerless job,
    * which is invisible to every chat session and manageable only from the

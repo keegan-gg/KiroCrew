@@ -2189,7 +2189,12 @@
       "save": "Save",
       "saving": "Saving...",
       "select_at_least_one_day": "Select at least one day",
-      "timezone": "Timezone"
+      "timezone": "Timezone",
+      "chat_folder": "Chat folder",
+      "chat_folder_none": "Do not file runs",
+      "chat_folder_description": "File every run of this job into a folder in the chat sidebar, so the folder reads as this job's history. Notifications and Slack delivery are unchanged.",
+      "chat_folder_hidden_in_chat": "Turn off “Hide in chat” to use this. A hidden job's runs get no chat session, so there is nothing to file.",
+      "chat_folder_list_unavailable": "Could not load your chat folders. Reload to pick one."
     },
     "jobLogsView": {
       "failed_to_load_history": "Failed to load history"

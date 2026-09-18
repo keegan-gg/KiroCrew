@@ -6755,7 +6755,12 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "O prompt ou a tarefa enviado ao agente quando este job dispara",
       "timezone": "Fuso horário",
       "weekly_schedule": "Agendamento semanal",
-      "which_agent_handles_this_job_leave_default_for_t": "Qual agente cuida deste job. Deixe como padrão para o agente principal."
+      "which_agent_handles_this_job_leave_default_for_t": "Qual agente cuida deste job. Deixe como padrão para o agente principal.",
+      "chat_folder": "Pasta de conversa",
+      "chat_folder_none": "Não arquivar as execuções",
+      "chat_folder_description": "Arquive cada execução desta tarefa em uma pasta da barra lateral de conversas, para que a pasta sirva como o histórico dela. As notificações e a entrega pelo Slack não mudam.",
+      "chat_folder_hidden_in_chat": "Desative “Ocultar na conversa” para usar isto. As execuções de uma tarefa oculta não criam nenhuma sessão de conversa, então não há nada para arquivar.",
+      "chat_folder_list_unavailable": "Não foi possível carregar suas pastas de conversa. Recarregue a página para escolher uma."
     },
     "jobLogsView": {
       "cancel": "Cancelar",

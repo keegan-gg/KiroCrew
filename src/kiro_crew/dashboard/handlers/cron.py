@@ -38,8 +38,10 @@ from kiro_crew.cron_script import (
     validate_secret_env_grant,
 )
 from kiro_crew.dashboard.cron_inject import (
+    chat_folder_exists,
+    deliver_cron_run,
     hydrate_slot_from_history,
-    inject_cron_result_to_dashboard,
+    unfile_cron_job_tab,
 )
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
@@ -568,6 +570,42 @@ async def api_cron_tools(request: web.Request) -> web.Response:
     return web.json_response({"result": result})
 
 
+def _resolve_chat_folder_id(
+    state: DashboardState, value: object
+) -> tuple[str, web.Response | None]:
+    """Validate a submitted ``chat_folder_id``: ``(id, None)`` or ``("", 400)``.
+
+    ONE validator for create and update, because the two halves of the check
+    answer different questions and only one of them is a type check:
+
+    * shape -- ``None`` means "not filed" (so a client can clear the field by
+      sending null), anything non-string or over-cap is a 400, matching how
+      ``folder_id`` is handled two fields over;
+    * EXISTENCE -- an id naming no folder in the sidebar's tree is refused here,
+      at save time. The runtime treats a dangling id as "not filed" by contract
+      (a folder can be deleted after the job is saved, and a run must not fail
+      over that), but a save is the one moment a person is present to be told.
+      Accepting an unknown id would persist a setting whose only observable
+      behaviour is a log line nobody reads.
+    """
+    if value is None:
+        return "", None
+    if not isinstance(value, str) or len(value) > MAX_SHORT_STRING:
+        return "", web.json_response(
+            {"error": "invalid chat_folder_id format", "code": "invalid_chat_folder_id"},
+            status=400,
+        )
+    folder_id = value.strip()
+    if not folder_id:
+        return "", None
+    if not chat_folder_exists(state, folder_id):
+        return "", web.json_response(
+            {"error": "unknown chat folder", "code": "unknown_chat_folder"},
+            status=400,
+        )
+    return folder_id, None
+
+
 async def api_crons_create(request: web.Request) -> web.Response:
     """POST /api/crons — create a cron job."""
     state: DashboardState = request.app["state"]
@@ -643,6 +681,11 @@ async def api_crons_create(request: web.Request) -> web.Response:
             {"error": "invalid folder_id format", "code": "invalid_folder_id"},
             status=400,
         )
+    # The CHAT folder every run of this job is filed into -- a different tree
+    # from folder_id's, which groups the job's row on the Schedule page.
+    chat_folder_id, chat_folder_err = _resolve_chat_folder_id(state, body.get("chat_folder_id"))
+    if chat_folder_err is not None:
+        return chat_folder_err
     # Validate model BEFORE add_job so an invalid value never leaves an
     # orphaned job behind (a retried create would then duplicate it).
     model_raw = body.get("model")
@@ -682,6 +725,7 @@ async def api_crons_create(request: web.Request) -> web.Response:
         "minimal_context": bool(minimal_context),
         "persistent_session": bool(persistent_session),
         "folder_id": folder_id,
+        "chat_folder_id": chat_folder_id,
         # Dashboard-only template provenance (see CronJob.source_preset). The
         # prompt SNAPSHOT is what makes the Schedule-page "template updated"
         # hint attributable: comparing it against the template's current prompt
@@ -853,6 +897,7 @@ async def api_cron_update(request: web.Request) -> web.Response:
         "minimal_context",
         "persistent_session",
         "folder_id",
+        "chat_folder_id",
     ):
         if key in body:
             kwargs[key] = body[key]
@@ -885,6 +930,17 @@ async def api_cron_update(request: web.Request) -> web.Response:
                 {"error": "invalid folder_id format", "code": "invalid_folder_id"},
                 status=400,
             )
+    # True when this request is the one that UNSETS the field. Recorded here and
+    # acted on after the store commits: the job's own tab has to come out of the
+    # folder it was filed in, and the save is the only moment that intent is
+    # unambiguous (see `unfile_cron_job_tab`).
+    chat_folder_cleared = False
+    if "chat_folder_id" in kwargs:
+        resolved, chat_folder_err = _resolve_chat_folder_id(state, kwargs["chat_folder_id"])
+        if chat_folder_err is not None:
+            return chat_folder_err
+        chat_folder_cleared = not resolved
+        kwargs["chat_folder_id"] = resolved
     # UI sends "agent"; internal kwarg is "agent_id". Accept "agent_id" for scripted callers.
     if "member_id" in body:
         try:
@@ -944,6 +1000,10 @@ async def api_cron_update(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=400)
     if not job:
         return web.json_response({"error": "job not found"}, status=404)
+    if chat_folder_cleared:
+        # AFTER the store commits, so a refused or busy save never moves a tab for
+        # a change that did not land.
+        await unfile_cron_job_tab(state, job)
     state.push_refresh("crons")
     return web.json_response({"ok": True, "id": job.id})
 
@@ -1711,7 +1771,7 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
         # Re-surfacing a stored result, not delivering a fresh run: the prompt
         # that produced it is not recoverable from live config -- see
         # inject_cron_result_to_dashboard's ``include_prompt``.
-        inject_cron_result_to_dashboard(
+        await deliver_cron_run(
             state, job, job.last_result or "", history=history, include_prompt=False
         )
     else:
@@ -2816,6 +2876,7 @@ async def api_crons(request: web.Request) -> web.Response:
             # persistent session on a job the user set to ephemeral.
             "persistent_session": j.persistent_session,
             "folder_id": j.folder_id,
+            "chat_folder_id": j.chat_folder_id,
             # The Schedule-page template this job was seeded from, or None. A
             # stable catalog id (e.g. "error-digest"), not user free-text, so
             # it is returned as-is; the frontend matches it against the live

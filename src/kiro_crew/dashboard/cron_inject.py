@@ -7,15 +7,24 @@ gateway.py and dashboard.handlers.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.dashboard.state import DashboardState, SlotOrigin, row_mid
+from kiro_crew.dashboard.state import (
+    MAX_LIVE_SLOTS,
+    DashboardState,
+    SlotOrigin,
+    row_mid,
+)
 from kiro_crew.history import append_rows_if_absent_off_loop
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.sel import sel
 
 if TYPE_CHECKING:
     from kiro_crew.cron import CronJob
+
+logger = logging.getLogger(__name__)
 
 
 def context_meter_reading(client: object) -> dict[str, Any] | None:
@@ -368,10 +377,190 @@ def _safe_job_name(job: "CronJob") -> str:
     return safe_name
 
 
+def chat_folder_exists(state: DashboardState, folder_id: str) -> bool:
+    """Whether *folder_id* names a folder in the chat sidebar's tree right now.
+
+    Read straight off the loaded store rather than through the folder API: this
+    runs on the event loop inside the synchronous delivery window, and the
+    question is a membership test on a list the same loop owns.
+    """
+    if not folder_id:
+        return False
+    return any(str(f.get("id")) == folder_id for f in getattr(state, "_folders", None) or ())
+
+
+def per_run_tab_would_exceed_the_slot_ceiling(state: DashboardState) -> bool:
+    """Whether minting one more live slot would cross ``MAX_LIVE_SLOTS``.
+
+    A per-run tab is the one cron surface that mints a slot per FIRE, so it is
+    also the one that can walk a short-interval job into the global slot ceiling.
+    ``_bind_cron_slot`` reaches ``get_or_create_slot`` directly, below the check
+    ``session_control.create_session`` makes, so the bound has to be asked for
+    here or it is not asked at all.
+
+    Checked only for a per-run tab, never for the job-wide one: that slot is
+    created once and reused for the job's whole life, so refusing it at the
+    ceiling would silence an established job's delivery for a reason that has
+    nothing to do with it.
+    """
+    return state.live_slot_count() >= MAX_LIVE_SLOTS
+
+
+def cron_run_gets_tab(job: "CronJob") -> bool:
+    """Whether a RUN of *job* is given a dashboard tab when it delivers.
+
+    ONE predicate for every delivery site, because the answer grew a second
+    reason to be True and four hand-written copies of ``job.persistent_session
+    and not job.hide_in_chat`` would have had to learn it together:
+
+    * a persistent job keeps its single long-lived ``cron-<id>`` tab, as before;
+    * a STATELESS job now gets one too -- a fresh per-run tab -- but only when it
+      names a chat folder to file that tab into. Without a folder there is
+      nowhere for a per-run tab to live except loose in the sidebar, which is
+      the clutter ``persistent_session=False`` exists to avoid, so the answer
+      stays False and that job delivers exactly as it did before.
+
+    ``hide_in_chat`` still wins over both: it is the explicit "no tab" opt-out,
+    and a job carrying it plus a chat folder is contradicting itself. Resolving
+    it toward no-tab is the direction that cannot surprise anyone -- the flag is
+    the narrower, older and more emphatic statement.
+    """
+    if job.hide_in_chat:
+        return False
+    return job.persistent_session or bool(job.chat_folder_id)
+
+
+def cron_suppressed_run_gets_tab(state: DashboardState, job: "CronJob") -> bool:
+    """:func:`cron_run_gets_tab`, for a run whose delivery was SUPPRESSED.
+
+    The dedup and silent paths deliberately never CREATE the job-wide tab -- they
+    re-inject into one that already exists, so suppressed output cannot conjure a
+    tab nobody asked for. That rule is preserved verbatim for a persistent job.
+
+    A stateless job filing into a chat folder is the one case where it must not
+    apply: its tab is per-run, so "already exists" is never true and the rule
+    would silently drop every suppressed run from the timeline the user
+    configured the folder to see. A suppressed run is still a run that happened,
+    and the folder is exactly where a reader would look for it.
+    """
+    if not cron_run_gets_tab(job):
+        return False
+    if job.persistent_session:
+        return state.has_slot(f"cron-{job.id}")
+    return True
+
+
+def file_cron_run_in_chat_folder(state: DashboardState, job: "CronJob", slot: Any) -> bool:
+    """File *slot* into the job's configured chat folder. True if it moved.
+
+    Best-effort by construction, and the failure direction is the contract: a
+    folder the user deleted while the job still named it leaves the session
+    UNFILED and the run otherwise untouched. The run has already produced its
+    result and delivered it; losing the sidebar placement is the whole cost, and
+    failing the run over a missing folder would trade a cosmetic loss for a lost
+    run. The skip is recorded once -- a log line and one SEL row -- so "why is
+    this run not in my folder?" has an answer without a repro.
+
+    Renaming needs no branch here: the job stores the folder's ID, so a renamed
+    folder is the same folder and the run follows it.
+
+    Returns False when there is nothing to do (no folder configured, already
+    filed, or the folder is gone), which is what lets the caller skip the
+    metadata persist in the common case.
+    """
+    target = job.chat_folder_id
+    if not target or getattr(slot, "folder_id", "") == target:
+        return False
+    if not chat_folder_exists(state, target):
+        logger.info(
+            "Cron '%s': chat folder %s is gone; run %s lands unfiled",
+            job.name,
+            target,
+            slot.key,
+        )
+        try:
+            sel().log_tool_invocation(
+                session_key=f"cron:{job.id}",
+                tool_name="cron_chat_folder_missing",
+                outcome="skipped",
+                downstream_service="none",
+            )
+        except Exception:
+            logger.debug("SEL logging failed for a missing cron chat folder", exc_info=True)
+        return False
+    slot.folder_id = target
+    return True
+
+
+async def unfile_cron_job_tab(state: DashboardState, job: "CronJob") -> None:
+    """Take the job's own tab out of whatever chat folder it was filed in.
+
+    Called when a save CLEARS ``chat_folder_id``. It has to happen at the save and
+    not at the next delivery, because at delivery the two states are
+    indistinguishable: a job with no folder and a tab sitting in one looks exactly
+    the same whether this feature put it there or the reader dragged it there by
+    hand, and unfiling on that guess would move a session the reader placed
+    themselves. At the save the intent is unambiguous -- they just cleared the
+    field -- so the clear is applied here, once, and the delivery path stays free
+    of a heuristic it cannot get right.
+
+    Only the JOB-WIDE tab moves. Per-run tabs from earlier runs stay where they
+    are: they are history, and a job's settings changing today is not a reason to
+    rewrite where last week's runs are filed.
+
+    Best-effort. A save must not fail because a tab could not be moved.
+    """
+    slot = state.get_slot(f"cron-{job.id}")
+    if slot is None or not getattr(slot, "folder_id", ""):
+        return
+    slot.folder_id = ""
+    try:
+        from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+        await save_slot_off_loop(state, slot, force=True)
+    except Exception:
+        logger.warning(
+            "Cron '%s': could not persist unfiling %s", job.name, slot.key, exc_info=True
+        )
+    state.push_slots_update()
+
+
+async def persist_cron_chat_folder(state: DashboardState, job: "CronJob", slot: Any) -> None:
+    """File the run's tab into the job's chat folder AND persist the placement.
+
+    The in-memory assignment alone is not the feature: a folder's browsable
+    timeline is read from the on-disk session list (``list_sessions`` carries
+    each session's ``folder_id``), so a placement that never reaches disk
+    disappears on the next restart and the folder shows nothing. A FORCED save is
+    what writes the metadata line -- the same route every other folder-filing
+    surface takes (``api_chat_slot_folder``).
+
+    Exception-contained on purpose: this runs after the result has already been
+    injected and delivered, so nothing here may turn a completed run into a
+    failed one.
+    """
+    if not file_cron_run_in_chat_folder(state, job, slot):
+        return
+    try:
+        from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+        await save_slot_off_loop(state, slot, force=True)
+    except Exception:
+        logger.warning(
+            "Cron '%s': could not persist the chat-folder placement of %s",
+            job.name,
+            slot.key,
+            exc_info=True,
+        )
+    state.push_slots_update()
+
+
 def _bind_cron_slot(
     state: DashboardState,
     job: "CronJob",
     history: list[dict[str, Any]] | None,
+    *,
+    run_session_key: str = "",
 ) -> Any:
     """Create-or-find the job's dashboard slot, bind its identity, publish it.
 
@@ -383,15 +572,63 @@ def _bind_cron_slot(
     hydration without the link would re-run on every bind. Keeping both under
     the one unlink guard makes every caller after the first an idempotent
     no-op, which is what lets the injection run unchanged after a pre-create.
+
+    Answers ``None`` when a PER-RUN tab would cross the live-slot ceiling -- see
+    :func:`per_run_tab_would_exceed_the_slot_ceiling`. The job-wide tab is never
+    refused, so every pre-existing caller still gets a slot.
+
+    ``run_session_key`` names the session this bind is for, and defaults to the
+    job-wide ``cron:{id}`` — the only shape that existed before per-run tabs, so
+    every caller that does not pass it keeps the exact slot, title and hydration
+    it had. A caller that DOES pass a per-run key (``cron:{id}:{run_id}``, minted
+    by ``build_cron_session_context`` for a stateless job) gets a tab of its own,
+    named by :func:`~kiro_crew.dashboard.chat_utils.cron_slot_name`, so a run
+    cannot append onto the previous run's transcript — which is the entire point
+    of ``persistent_session=False``.
     """
+    from kiro_crew.dashboard.chat_utils import cron_slot_name
+
+    session_key = run_session_key or f"cron:{job.id}"
+    slot_name = cron_slot_name(session_key)
+    if (
+        session_key != f"cron:{job.id}"
+        and state.get_slot(slot_name) is None
+        and per_run_tab_would_exceed_the_slot_ceiling(state)
+    ):
+        # Past the ceiling the run delivers without a tab rather than pushing the
+        # slot table over its bound. Returning None is what makes that a skip and
+        # not a silent success: the caller writes nothing, so no half-filed
+        # session appears in the folder. Recorded once per run, because "my folder
+        # stopped filling up" needs an answer and the count is the answer.
+        logger.warning(
+            "Cron '%s': live slots at the %d ceiling; run %s delivers without a tab",
+            job.name,
+            MAX_LIVE_SLOTS,
+            session_key,
+        )
+        try:
+            sel().log_tool_invocation(
+                session_key=f"cron:{job.id}",
+                tool_name="cron_per_run_tab_skipped",
+                outcome="skipped",
+                downstream_service="none",
+            )
+        except Exception:
+            logger.debug("SEL logging failed for a skipped per-run cron tab", exc_info=True)
+        return None
     slot = state.get_or_create_slot(
-        name=f"cron-{job.id}",
+        name=slot_name,
         agent=job.member_id or job.agent_id or "",
         # A cron result is the job's output, not something the person typed.
         # A USER label would expose it to any app holding `slots:user`.
         origin=SlotOrigin.CRON,
     )
-    slot.title = f"Cron: {_safe_job_name(job)}"
+    # A per-run tab carries the run stamp, because its siblings in the folder
+    # carry the same job name and nothing else would tell them apart. The
+    # job-wide tab keeps its historical title byte-for-byte: it is not a run, and
+    # a stamp there would rewrite the title on every delivery.
+    stamp = run_stamp(job) if session_key != f"cron:{job.id}" else ""
+    slot.title = f"Cron: {_safe_job_name(job)}{stamp}"
     # A provider-template alias on a legacy V1 job cannot authorize a private
     # member. Private cron dispatch publishes its protected session binding;
     # follow-up turns must use that binding instead of minting one from agent_id.
@@ -399,7 +636,7 @@ def _bind_cron_slot(
     if job.memory_store:
         slot.memory_store = job.memory_store
     if not slot.linked_session_key:
-        slot.linked_session_key = f"cron:{job.id}"
+        slot.linked_session_key = session_key
         hydrate_slot_from_history(slot, history or [])
     # Publish the (possibly just-created) tab to the dashboard-surface registry
     # BEFORE anything routes against it. Every gate that asks "does this session
@@ -422,7 +659,8 @@ def inject_cron_result_to_dashboard(
     include_prompt: bool = True,
     history: list[dict[str, Any]] | None,
     context_reading: dict[str, Any] | None = None,
-) -> None:
+    run_session_key: str = "",
+) -> Any:
     """Inject cron result into linked dashboard chat slot (shared by to-chat and auto-inject).
 
     ``history`` is the ``cron:{id}`` transcript, hydrated into the slot the first
@@ -467,8 +705,20 @@ def inject_cron_result_to_dashboard(
     can serve it after the executor resets the session. ``None`` (the to-chat
     replay path, or a run that measured nothing) records nothing and keeps
     whatever snapshot an earlier run stored.
+
+    ``run_session_key`` is this run's execution key, and it is what decides which
+    tab the run lands in -- ``""`` (every pre-existing caller) means the job-wide
+    ``cron:{id}`` tab and behaves exactly as before. See :func:`_bind_cron_slot`.
+
+    Returns the slot it wrote into, so a caller can carry out the steps that must
+    happen on the loop after the synchronous write -- filing the tab into the
+    job's chat folder and persisting that placement (:func:`deliver_cron_run`).
+    ``None`` means the run got no tab because a per-run one would have crossed the
+    live-slot ceiling; nothing was written.
     """
-    slot = _bind_cron_slot(state, job, history)
+    slot = _bind_cron_slot(state, job, history, run_session_key=run_session_key)
+    if slot is None:
+        return None
     safe_name = _safe_job_name(job)
 
     # Rows this call owes the durable transcript, in the order they happened.
@@ -498,8 +748,12 @@ def inject_cron_result_to_dashboard(
         in-memory slot. Without this, chat_runner.build_session_replay reads an
         empty cron:{id} log and the follow-up agent opens with no memory of the
         run the user is looking at. The stable linked key (cron:{id}) covers
-        both persistent and stateless crons, since the slot always links there
-        regardless of the per-run execution key.
+        A per-run tab links to its OWN key (``cron:{id}:{run_id}``), so the
+        transcript is written there instead: the point of that tab is a run that
+        does not share a conversation with its siblings, and writing every run
+        into ``cron:{id}`` would hand a follow-up turn the pile the per-run tab
+        exists to break up. The key is read off the slot for exactly that
+        reason -- one source, so the link and the transcript cannot disagree.
 
         ONE grouped write, not one per row: a run writes a prompt row AND a
         result row, and dispatching them separately hands two worker threads two
@@ -520,7 +774,7 @@ def inject_cron_result_to_dashboard(
             return
         append_rows_if_absent_off_loop(
             state.conversation_log,
-            f"cron:{job.id}",
+            slot.linked_session_key or f"cron:{job.id}",
             durable_rows,
             agent=job.agent_id or None,
         )
@@ -592,6 +846,42 @@ def inject_cron_result_to_dashboard(
             payload["reset"] = True
         state.broadcast_context_usage(slot.key, payload)
     state.push_slots_update()
+    return slot
+
+
+async def deliver_cron_run(
+    state: DashboardState,
+    job: "CronJob",
+    result_text: str,
+    *,
+    include_prompt: bool = True,
+    history: list[dict[str, Any]] | None,
+    context_reading: dict[str, Any] | None = None,
+    run_session_key: str = "",
+) -> Any:
+    """Write a run into its dashboard tab and file that tab in the job's folder.
+
+    The ONE entry point for every delivery site. The injection itself is
+    synchronous (it has to be: it is called from inside the executor's own
+    window) while the folder placement has to be persisted, which is I/O — so the
+    two halves cannot live in one function, and leaving the second half to each
+    call site is how the four copies of the delivery gate drifted in the first
+    place. Both halves, one call, in the order they must happen: a tab cannot be
+    filed before it exists.
+    """
+    slot = inject_cron_result_to_dashboard(
+        state,
+        job,
+        result_text,
+        include_prompt=include_prompt,
+        history=history,
+        context_reading=context_reading,
+        run_session_key=run_session_key,
+    )
+    if slot is None:
+        return None
+    await persist_cron_chat_folder(state, job, slot)
+    return slot
 
 
 async def prefetch_cron_history(state: DashboardState, job_id: str) -> list[dict[str, Any]] | None:
@@ -617,6 +907,23 @@ async def prefetch_cron_history(state: DashboardState, job_id: str) -> list[dict
     return await asyncio.to_thread(state.conversation_log.read_messages, f"cron:{job_id}")
 
 
+async def prefetch_cron_run_history(
+    state: DashboardState, job: "CronJob"
+) -> list[dict[str, Any]] | None:
+    """The history a DELIVERY should hydrate a newly bound cron tab from.
+
+    A per-run tab is hydrated from nothing, and that is not an optimisation: a
+    stateless job runs on a fresh session precisely so this run carries no
+    context from the last one, and pouring the job-wide transcript into its tab
+    would put back exactly what the setting removed. Returning ``None`` (the
+    parameter's documented "will not be needed" value) also skips the whole-file
+    read, so the tab that needs no history does not pay for one.
+    """
+    if not job.persistent_session:
+        return None
+    return await prefetch_cron_history(state, job.id)
+
+
 async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
     """Make an eligible job's tab exist — and carry its identity — at run START.
 
@@ -636,6 +943,15 @@ async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
     job.hide_in_chat``) is pre-created. For everything else,
     no-tab / no-identity / no-dispatch stays the deliberate fail-closed
     contract — an ineligible job is untouched by this call.
+
+    A stateless job filing runs into a chat folder is deliberately NOT pre-created
+    here even though it does get a tab at delivery. Its tab is per-RUN, so
+    pre-creating one would file a session into the user's folder before the run has
+    produced anything -- and a run that ends without a result (an error, a
+    cancellation, a governance refusal) would leave an empty session sitting in the
+    timeline for good, since nothing later removes it. Minting that tab at delivery
+    instead costs the run the first-run caller identity a persistent job gets, and
+    buys a folder in which every entry is a run that actually produced output.
 
     Cheap on every run after the first: an existing linked slot returns before
     any transcript I/O. The first bind reads the ``cron:{id}`` history via
