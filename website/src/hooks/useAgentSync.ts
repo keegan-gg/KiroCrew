@@ -67,11 +67,12 @@ export function useAgentSync() {
 
     const pollCron = async () => {
       try {
-        const cronData = await api.crons() as CronJob[]
-        cronResult = cronData.filter(c => c.enabled).slice(0, 3).map(cr => ({
+        const cronData = await api.crons() as { jobs?: CronJob[] }
+        const jobs = Array.isArray(cronData.jobs) ? cronData.jobs : []
+        cronResult = jobs.filter(c => c.enabled).slice(0, 3).map(cr => ({
           id: 'cron-' + cr.id, name: shortName(cr.name || cr.id),
           label: 'cron', kind: 'cron' as const,
-          running: cr.last_status === 'running', detail: cr.schedule,
+          running: cr.is_running === true, detail: cr.schedule,
         }))
       } catch { /* ignore */ }
       update()
@@ -80,8 +81,9 @@ export function useAgentSync() {
 
     const pollSpawn = async () => {
       try {
-        const spawnData = await api.spawnList() as SubagentInfo[]
-        spawnResult = spawnData.filter(s => !s.done).slice(0, 3).map(sp => ({
+        const spawnData = await api.spawnList() as { agents?: SubagentInfo[] }
+        const children = Array.isArray(spawnData.agents) ? spawnData.agents : []
+        spawnResult = children.filter(s => !s.done).slice(0, 3).map(sp => ({
           id: 'spawn-' + sp.id, name: shortName(sp.task, 45),
           label: 'spawn', kind: 'spawn' as const,
           running: !sp.done, detail: sp.done ? 'done' : 'running',
