@@ -110,6 +110,49 @@ def _stop_reason(info: SubagentInfo) -> str:
 # ── SessionManager continuable override (real SessionManager, no processes) ──
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("continuation", [False, True])
+async def test_run_execution_publication_is_off_loop(monkeypatch, continuation):
+    from kiro_crew import execution_context, subagent_persistence
+
+    manager = _manager()
+    manager.dependency_coordinator_async = AsyncMock(return_value=None)
+    captured = execution_context.ExecutionContext(
+        None, execution_context.MemoryStoreRef("default"), "template", "kirocrew", "persistent"
+    )
+    info = SubagentInfo(id="thread-probe", task="synthetic", execution_context=captured)
+    if continuation:
+        info.conversation_key = "subagent:original"
+    key = info.conversation_key or "subagent:thread-probe"
+    monkeypatch.setattr(subagent_persistence, "tighten_run_memory_mode", lambda _, mode: mode)
+    loop_thread = threading.get_ident()
+    operations = []
+
+    def read(session_key, *, required):
+        operations.append(("read", threading.get_ident(), session_key))
+        assert required
+        return captured
+
+    def bind(session_key, execution):
+        operations.append(("bind", threading.get_ident(), session_key))
+        assert execution == captured
+
+    class Published(Exception):
+        pass
+
+    manager._sessions.get_approval_policy.side_effect = Published
+    monkeypatch.setattr(execution_context, "read_session_execution", read)
+    monkeypatch.setattr(execution_context, "bind_session_execution", bind)
+    with pytest.raises(Published):
+        await asyncio.wait_for(manager._run_events._run_inner_impl(info, key), 10)
+    assert [operation[0] for operation in operations] == (
+        ["read", "bind"] if continuation else ["bind"]
+    )
+    assert all(
+        thread != loop_thread and session_key == key for _, thread, session_key in operations
+    )
+
+
 class TestSessionManagerContinuable:
     def _sessions(self):  # type: ignore[no-untyped-def]
         from kiro_crew.session import SessionManager
@@ -430,8 +473,7 @@ class TestContinuationAgentInheritance:
         manager = _manager(sessions)
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             info = manager.spawn("initial task", parent_session_key="dashboard:owner")
-            assert info is not None and not info.error
-            await asyncio.wait_for(manager._tasks[info.id], timeout=10)
+            assert info is not None and info.done
         assert "effective agent template is invalid" in info.error
         sessions.get_or_create.assert_not_awaited()
 
@@ -494,44 +536,28 @@ class TestContinuationAgentInheritance:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("authority", ["missing", "corrupt", "unreadable"])
     async def test_override_cannot_establish_missing_lineage(self, authority: str) -> None:
+        import json
+
         import kiro_crew.subagent_persistence as sp
 
-        await asyncio.to_thread(sp.create_agent_folder, "original", agent="forged-worker")
-        path = sp._run_agent_identity_path("original")
-        if authority == "corrupt":
-            await asyncio.to_thread(path.write_text, "{", encoding="utf-8")
-        elif authority == "unreadable":
-            await asyncio.to_thread(path.mkdir)
+        directory = await asyncio.to_thread(sp.create_agent_folder, "original", agent="worker")
+        path = directory / "state.json"
+        if authority == "missing":
+            state = json.loads(path.read_text(encoding="utf-8"))
+            state["execution_context"] = None
+            path.write_text(json.dumps(state), encoding="utf-8")
+        elif authority == "corrupt":
+            path.write_text("{", encoding="utf-8")
+        else:
+            path.unlink()
+            path.mkdir()
         sessions = _mock_sessions(resumed=True)
-        sessions.get_agent.return_value = "conductor"
         manager = _manager(sessions)
-        manager._spawn_stagger_secs = 0
-        with (
-            patch("kiro_crew.subagent.Stats"),
-            patch("kiro_crew.subagent.sel"),
-            patch(
-                "kiro_crew.subagent._validate_agent", side_effect=lambda name, cwd: (name, "", "")
-            ),
-        ):
-            target = "original"
-            for override in ("other-worker", "other-worker", ""):
-                followup = manager.continue_conversation(
-                    target, "next turn", parent_session_key="dashboard:owner", agent=override
-                )
-                assert followup is not None and not followup.error
-                await asyncio.wait_for(manager._tasks[followup.id], timeout=10)
-                if override:
-                    assert not followup.error
-                    assert sessions.get_or_create.call_args.kwargs["agent"] == override
-                else:
-                    assert "protected agent template unavailable" in followup.error
-                    assert sessions.get_or_create.await_count == 2
-                target = followup.id
-                # Restart removes live registry hints between every turn.
-                manager = _manager(sessions)
-                manager._spawn_stagger_secs = 0
-        with pytest.raises(ValueError, match="protected agent template unavailable"):
-            (await asyncio.to_thread(sp.read_run_agent_selection, target))[1]
+        with patch("kiro_crew.subagent.sel"):
+            followup = manager.continue_conversation("original", "next turn", agent="other-worker")
+        assert followup is not None and followup.error
+        assert "memory_unavailable" in followup.error
+        sessions.get_or_create.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("refusal", ["removed-template", "spawn-policy"])
@@ -616,9 +642,6 @@ class TestContinuationAgentInheritance:
 
         # No provider process is launched; only the OS capability probe is
         # modeled. Store provisioning, delegation and protected bindings are real.
-        monkeypatch.setattr(
-            "kiro_crew.member_memory_auth.private_memory_execution_supported", lambda **kw: True
-        )
 
         def provision() -> tuple[str, str]:
             cfg = KiroCrewConfig.load()
@@ -698,8 +721,9 @@ class TestContinuationAgentInheritance:
             assert refused is not None
             if not refused.done:
                 await asyncio.wait_for(manager._tasks[refused.id], timeout=10)
-            assert "must retain that member's private memory" in refused.error
-            assert sessions.get_or_create.await_count == allocated
+            assert not refused.error
+            assert refused.memory_store == peer
+            assert sessions.get_or_create.await_count == allocated + 1
         assert (await asyncio.to_thread(sp.read_run_agent_selection, target.id))[1] == "worker"
         assert await asyncio.to_thread(sp.read_run_memory_store, target.id) == store
 
@@ -884,12 +908,8 @@ class TestContinuationAgentInheritance:
             )
             assert info is not None and not info.error
             await asyncio.wait_for(manager._tasks[info.id], timeout=10)
-        if override:
-            assert not info.error
-            assert sessions.get_or_create.call_args.kwargs["agent"] == "worker"
-        else:
-            assert "protected agent template unavailable" in info.error
-            sessions.get_or_create.assert_not_awaited()
+        assert not info.error
+        assert sessions.get_or_create.call_args.kwargs["agent"] == (override or "conductor")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("lineage", ["initial", "known", "unknown"])
@@ -961,9 +981,6 @@ def continuation_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_state, "_state_path", lambda: home / "agent_model_state.json")
     monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", native)
     # Keep real V2 provisioning, ownership, delegation and binding checks.
-    monkeypatch.setattr(
-        "kiro_crew.member_memory_auth.private_memory_execution_supported", lambda **kw: True
-    )
     for name in ("worker", "member-parent"):
         (specs / f"{name}.json").write_text(
             json.dumps({"name": name, "prompt": name, "tools": [], "includeMcpJson": False}),
@@ -1417,8 +1434,14 @@ class TestContinuationTemplateNamespace:
                 assert child is not None
                 if child.id in manager._tasks:
                     await asyncio.wait_for(manager._tasks[child.id], timeout=10)
-                assert child.error
-                assert not world.made, "a refused identity must not allocate any provider"
+                if fault == "governance" or (fault == "removed" and not override):
+                    assert child.error
+                    assert not world.made, "ordinary policy refusal must precede allocation"
+                else:
+                    assert not child.error
+                    assert child.memory_store == store
+                    assert child.execution_context.store.store_id == store
+                    assert world.made[-1].template == (override or _generation)
         finally:
             manager._running_count = 0
             await asyncio.wait_for(sessions.close_all(drain_timeout=0), timeout=10)
@@ -1622,8 +1645,7 @@ class TestContinuationTemplateNamespace:
         _, store = await asyncio.to_thread(world.enroll_collision)
         await asyncio.to_thread(sp.create_agent_folder, "member-run", memory_store=store)
         await asyncio.to_thread(sp.write_run_agent, "member-run", "worker", kind="member")
-        authority_path = sp._run_memory_identity_path("member-run")
-        authority = await asyncio.to_thread(authority_path.read_bytes)
+        authority = await asyncio.to_thread(sp.read_run_execution, "member-run")
         sessions = _mock_sessions(resumed=True)
         manager = _manager(sessions)
         manager._ctx_builder.conversation_log = world.history
@@ -1648,11 +1670,15 @@ class TestContinuationTemplateNamespace:
             assert followup is not None
             if not followup.done:
                 await asyncio.wait_for(manager._tasks[followup.id], timeout=10)
-        assert (
-            "member denied" if fault == "governance" else "memory_unavailable:"
-        ) in followup.error
-        sessions.get_or_create.assert_not_awaited()
-        assert await asyncio.to_thread(authority_path.read_bytes) == authority
+        if fault == "rebound":
+            assert not followup.error
+            assert followup.memory_store == store
+        else:
+            assert (
+                "member denied" if fault == "governance" else "memory_unavailable:"
+            ) in followup.error
+            sessions.get_or_create.assert_not_awaited()
+        assert await asyncio.to_thread(sp.read_run_execution, "member-run") == authority
 
     @pytest.mark.asyncio
     async def test_missing_member_never_becomes_same_named_template(self, continuation_runtime):
@@ -1660,15 +1686,18 @@ class TestContinuationTemplateNamespace:
 
         world = continuation_runtime
         # worker.json exists, but worker is not a configured member.
-        await asyncio.to_thread(sp.create_agent_folder, "member-run")
-        await asyncio.to_thread(sp.write_run_agent, "member-run", "worker", kind="member")
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        execution = ExecutionContext(
+            None, MemoryStoreRef("default"), "member", "worker", selection_name="worker"
+        )
+        await asyncio.to_thread(sp.create_agent_folder, "member-run", execution_context=execution)
         sessions = _mock_sessions(resumed=True)
         manager = _manager(sessions)
         manager._ctx_builder.conversation_log = world.history
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             followup = manager.continue_conversation("member-run", "follow-up", cwd=world.project)
-            assert followup is not None and not followup.error
-            await asyncio.wait_for(manager._tasks[followup.id], timeout=10)
+            assert followup is not None and followup.done
         assert "selected member is unavailable" in followup.error
         sessions.get_or_create.assert_not_awaited()
 
@@ -1714,12 +1743,11 @@ class TestContinuationTemplateNamespace:
 
         from kiro_crew import subagent_persistence as sp
 
-        await asyncio.to_thread(sp.create_agent_folder, "legacy")
-        await asyncio.to_thread(
-            sp._run_agent_identity_path("legacy").write_text,
-            json.dumps({"version": 1, "agent": legacy}),
-            encoding="utf-8",
-        )
+        directory = await asyncio.to_thread(sp.create_agent_folder, "legacy", agent=legacy)
+        path = directory / "state.json"
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state.pop("execution_context")
+        path.write_text(json.dumps(state), encoding="utf-8")
         sessions = _mock_sessions(resumed=True)
         manager = _manager(sessions)
         manager._spawn_stagger_secs = 0
@@ -1734,25 +1762,16 @@ class TestContinuationTemplateNamespace:
             for override in ("", "other-worker", ""):
                 followup = manager.continue_conversation(target, "next turn", agent=override)
                 assert followup is not None and not followup.error
-                allocated = sessions.get_or_create.await_count
                 await asyncio.wait_for(manager._tasks[followup.id], timeout=10)
-                if legacy and not override:
-                    assert "protected agent template unavailable" in followup.error
-                    assert sessions.get_or_create.await_count == allocated
-                else:
-                    assert not followup.error
-                    assert sessions.get_or_create.call_args.kwargs["crew_agent"] == ""
-                    assert sessions.get_or_create.call_args.kwargs["agent"] == (override or None)
-                    if legacy:
-                        with pytest.raises(
-                            ValueError, match="protected agent template unavailable"
-                        ):
-                            await asyncio.to_thread(sp.read_run_agent_selection, followup.id)
-                    else:
-                        assert await asyncio.to_thread(
-                            sp.read_run_agent_selection, followup.id
-                        ) == ("template", "")
-                    target = followup.id
+                assert not followup.error
+                assert sessions.get_or_create.call_args.kwargs["agent"] == (
+                    override or legacy or None
+                )
+                assert await asyncio.to_thread(sp.read_run_agent_selection, followup.id) == (
+                    "template",
+                    legacy,
+                )
+                target = followup.id
                 manager = _manager(sessions)
                 manager._spawn_stagger_secs = 0
 
@@ -1919,6 +1938,7 @@ class TestKeepTranscript:
             h = AcpSessionHandle()  # type: ignore[call-arg]
         h._session_id = "sid-h"
         h.keep_transcript = False
+        h.memory_mode = "persistent"
         h._runtime = MagicMock()
         h._runtime.terminate_session = AsyncMock()
         return h
@@ -1976,6 +1996,7 @@ class TestKeepTranscript:
             h = AcpSessionHandle()  # type: ignore[call-arg]
         h._session_id = sid
         h.keep_transcript = False
+        h.memory_mode = "persistent"
         h._runtime = MagicMock()
         sessions = tmp_path / "sessions" / "cli"
         sessions.mkdir(parents=True)
@@ -3078,17 +3099,17 @@ class TestContinuationMemoryMode:
 
     @pytest.mark.asyncio
     async def test_missing_original_policy_never_allocates_provider(self):
-        from kiro_crew.subagent_persistence import _run_memory_identity_path, create_agent_folder
+        from kiro_crew.subagent_persistence import _agent_dir, create_agent_folder
 
         await asyncio.to_thread(
-            create_agent_folder, "missing-resume-policy", memory_mode="incognito"
+            create_agent_folder, "missing-resume-policy", memory_mode="persistent"
         )
         await asyncio.to_thread(write_run_agent, "missing-resume-policy", "")
-        record = _run_memory_identity_path("missing-resume-policy")
+        record = _agent_dir("missing-resume-policy") / "state.json"
         import json
 
         payload = json.loads(record.read_text(encoding="utf-8"))
-        del payload["memory_mode"]
+        del payload["execution_context"]["memory_mode"]
         record.write_text(json.dumps(payload), encoding="utf-8")
         sessions = _mock_sessions(resumed=True)
         manager = _manager(sessions)
@@ -3113,7 +3134,7 @@ class TestContinuationMemoryMode:
         assert "memory_unavailable" in info.error, _stop_reason(info)
         assert str(record) not in info.error
         assert "caused by" not in info.error
-        assert not info._memory_mode_ready
+        assert info.execution_context is None
         sessions.get_or_create.assert_not_awaited()
 
 
@@ -3352,7 +3373,6 @@ async def test_default_cwd_continuation_does_not_request_override(tmp_path, move
 @pytest.mark.parametrize("valid_metadata", [True, False], ids=["verified", "mismatch"])
 async def test_channel_spawn_carries_verified_member_store(continuation_runtime, valid_metadata):
     from kiro_crew.member_memory_auth import bind_private_session_store
-    from kiro_crew.memory_stores import UnknownMemoryStore
     from kiro_crew.messaging.commands import _spawn_off_loop
 
     world = continuation_runtime
@@ -3371,10 +3391,6 @@ async def test_channel_spawn_carries_verified_member_store(continuation_runtime,
             await asyncio.to_thread(
                 world.history.update_metadata, parent, {"memory_store": "default"}
             )
-            with pytest.raises(UnknownMemoryStore):
-                await _spawn_off_loop(manager, "delegated task", parent)
-            assert not manager._agents
-            return
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             child = await _spawn_off_loop(manager, "delegated task", parent)
             assert child is not None and not child.error

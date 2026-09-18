@@ -347,6 +347,62 @@ class ContinuationCoordinator(ManagerComponent):
         """:meth:`continue_conversation_impl` for event-loop callers: the same
         prelude, then ``spawn_async`` (write-before-ack with the store write on
         its writer thread)."""
+        # Keep map/busy/promotion mutations on-loop. Only the missing owner's
+        # immutable record is read by the worker, then the prelude rechecks busy.
+        from kiro_crew.execution_context import stricter_memory_mode
+
+        conv_key = f"subagent:{conv_id}"
+        if self._manager._conversation_busy(conv_key) is not None:
+            busy_result = self._manager._continue_prelude(
+                conv_id,
+                task,
+                parent_session_key,
+                agent,
+                model,
+                max_turns,
+                cwd,
+                _preassigned_id,
+                _memory_mode,
+            )
+            assert not isinstance(busy_result, dict)
+            return busy_result
+        original = self._manager._agents.get(conv_id)
+        execution = original.execution_context if original is not None else None
+        state = ...
+        try:
+            if _memory_mode is None:
+                resolver = self._manager._memory_mode_for_session
+                _memory_mode = (
+                    resolver(parent_session_key) if resolver is not None else "persistent"
+                )
+            if execution is None or not self._manager._sessions.resumable_sid(conv_key):
+
+                def read_snapshot():
+                    row = self._persistence.read_state(conv_id)
+                    captured = (
+                        self._persistence.read_run_execution(conv_id, state=row)
+                        if row is not None
+                        else None
+                    )
+                    return row or {}, captured
+
+                state, restored = await asyncio.to_thread(read_snapshot)
+                execution = execution or restored
+            if execution is not None:
+                execution = self._manager._admission.resolve_spawn_execution(
+                    conversation_key=conv_key,
+                    agent=agent,
+                    _memory_mode=stricter_memory_mode(execution.memory_mode, _memory_mode),
+                    _record=execution,
+                )
+        except (OSError, ValueError) as exc:
+            return SubagentInfo(
+                id=_preassigned_id or uuid.uuid4().hex[:8],
+                task=_redact(task),
+                done=True,
+                parent_session_key=parent_session_key,
+                error=f"memory_unavailable: {exc}",
+            )
         prelude = self._manager._continue_prelude(
             conv_id,
             task,
@@ -357,6 +413,8 @@ class ContinuationCoordinator(ManagerComponent):
             cwd,
             _preassigned_id,
             _memory_mode,
+            _execution_context=execution,
+            _captured_state=state,
         )
         if not isinstance(prelude, dict):
             return prelude
@@ -373,6 +431,9 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        *,
+        _execution_context=None,
+        _captured_state=...,
     ) -> "SubagentInfo | dict[str, Any] | None":
         """Dispatch a follow-up *task* into conversation *conv_id*.
 
@@ -398,16 +459,6 @@ class ContinuationCoordinator(ManagerComponent):
         - ``conversation_gone`` — no resumable session files remain.
         """
         conv_key = f"subagent:{conv_id}"
-        try:
-            memory_store = self._manager._inherited_memory_store(conv_id)
-        except (OSError, ValueError) as exc:
-            return SubagentInfo(
-                id=_preassigned_id or uuid.uuid4().hex[:8],
-                task=_redact(task),
-                done=True,
-                parent_session_key=parent_session_key,
-                error=f"memory_unavailable: {exc}",
-            )
         busy = self._manager._conversation_busy(conv_key)
         if busy is not None:
             info = SubagentInfo(
@@ -431,7 +482,7 @@ class ContinuationCoordinator(ManagerComponent):
         # exists yet (default runs never write one at spawn; the map is also
         # in-memory-lost across gateway restarts while state.json persists).
         if not self._manager._sessions.resumable_sid(conv_key):
-            state = read_state(conv_id) or {}
+            state = (read_state(conv_id) or {}) if _captured_state is ... else _captured_state
             sid = str(state.get("session_id") or "")
             if sid:
                 self._manager._sessions.seed_conversation(
@@ -477,13 +528,36 @@ class ContinuationCoordinator(ManagerComponent):
                 ),
             )
             return info
+        try:
+            if _execution_context is not None:
+                memory_store = _execution_context.store.legacy_name
+            elif _captured_state is not ...:
+                raise ValueError("run record is unavailable")
+            else:
+                memory_store = self._manager._inherited_memory_store(conv_id)
+        except (OSError, ValueError) as exc:
+            return SubagentInfo(
+                id=_preassigned_id or uuid.uuid4().hex[:8],
+                task=_redact(task),
+                done=True,
+                parent_session_key=parent_session_key,
+                error=f"memory_unavailable: {exc}",
+            )
         # The old registry record can disappear after eviction or restart. A
         # follow-up must retain its app profile before admission and before it
         # can establish the canonical HTTP caller. Writable state is not proof
         # that a legacy run belonged to the dashboard user.
         try:
             original = self._manager._agents.get(conv_id)
-            app = original.app if original is not None else self._persistence.read_run_app(conv_id)
+            app = (
+                _execution_context.app
+                if _execution_context is not None
+                else (
+                    original.app
+                    if original is not None
+                    else self._persistence.read_run_app(conv_id)
+                )
+            )
             if not isinstance(app, str):
                 raise ValueError("protected app ownership unavailable; start a new conversation")
         except (OSError, ValueError) as exc:
@@ -526,7 +600,11 @@ class ContinuationCoordinator(ManagerComponent):
                     f"unavailable for {conv_id}; retry the continuation"
                 ),
             )
-        inc_memory, inc_lessons, inc_project = self._manager._inherited_context_groups(conv_id)
+        inc_memory, inc_lessons, inc_project = (
+            self._manager._inherited_context_groups(conv_id)
+            if _captured_state is ...
+            else self._inherited_context_groups_impl(conv_id, state=_captured_state)
+        )
         # A continuation has to run WHERE THE RUN RAN. `spawn` resolves an empty
         # cwd to the pool project before it validates the agent name, so a run
         # spawned against a project-local agent (defined under that project's
@@ -560,6 +638,11 @@ class ContinuationCoordinator(ManagerComponent):
             memory_store=memory_store,
             _memory_mode=_memory_mode,
             app=app,
+            **(
+                {"_execution_context": _execution_context.to_record()}
+                if _execution_context is not None
+                else {}
+            ),
         )
 
     def _inherited_memory_store_impl(self, conv_id: str) -> str:
@@ -601,7 +684,7 @@ class ContinuationCoordinator(ManagerComponent):
                 return ""
         return recorded
 
-    def _inherited_context_groups_impl(self, conv_id: str) -> tuple[bool, bool, bool]:
+    def _inherited_context_groups_impl(self, conv_id: str, *, state=...) -> tuple[bool, bool, bool]:
         """Recover the context scope of the run being continued.
 
         A continuation DOES rebuild session context: ``get_or_create`` reports
@@ -619,7 +702,7 @@ class ContinuationCoordinator(ManagerComponent):
         live = self._manager._agents.get(conv_id)
         if live is not None:
             return live.include_memory, live.include_lessons, live.include_project
-        raw = (read_state(conv_id) or {}).get("context_groups")
+        raw = ((read_state(conv_id) or {}) if state is ... else state).get("context_groups")
         if raw is None:
             return True, True, True
         groups = {g for g in str(raw).split(",") if g}

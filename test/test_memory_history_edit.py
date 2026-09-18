@@ -26,16 +26,21 @@ async def test_private_history_read_edit_save_keeps_prior_days_once(
     env, monkeypatch, has_today, line_ending
 ):
     store = await document_store(env, "member-alice")
-    today = store._today_history_file()
-    monkeypatch.setattr(store, "_today_history_file", lambda: today)
-    yesterday = today.with_name(f"{date.fromisoformat(today.stem) - timedelta(days=1)}.md")
+    tier = env.tiers["member-alice"]
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
     older_bytes = b"# Prior day\nRetained yesterday sentinel.\n"
-    await asyncio.to_thread(yesterday.write_bytes, older_bytes)
+
+    def seed_day(day, content):
+        with tier.db:
+            tier._write_history(day, content, "test", "")
+
+    await asyncio.to_thread(seed_day, yesterday, older_bytes.decode("utf-8"))
     original = line_ending.join(
         ["# 1999-01-01", "An owner heading is ordinary content.", "Today sentinel.", ""]
     )
     if has_today:
-        await asyncio.to_thread(today.write_text, original, encoding="utf-8", newline="")
+        await asyncio.to_thread(seed_day, today, original)
     expected = original if has_today else ""
 
     for visit in range(2):
@@ -59,8 +64,13 @@ async def test_private_history_read_edit_save_keeps_prior_days_once(
             ).clone(method="PUT")
         )
         assert saved.status == 200
-        assert await asyncio.to_thread(today.read_bytes) == expected.encode("utf-8")
-        assert await asyncio.to_thread(yesterday.read_bytes) == older_bytes
+        entries = {
+            row["date"]: row["content"]
+            for row in await asyncio.to_thread(tier.read_history_entries)
+        }
+        assert entries[today].encode("utf-8") == expected.encode("utf-8")
+        assert entries[yesterday].encode("utf-8") == older_bytes
+        assert not store._history_dir.exists()
         aggregate = await asyncio.to_thread(store.read_recent_history)
         assert aggregate.count("Retained yesterday sentinel.") == 1
         assert aggregate.count("Owner daily edit sentinel.") == 1
@@ -80,7 +90,9 @@ async def test_private_profile_unchanged_save_preserves_line_endings(env, docume
     target = getattr(store, f"_{document}_file")
     other_document = "projects" if document == "preferences" else "preferences"
     other_target = getattr(store, f"_{other_document}_file")
-    other_bytes = await asyncio.to_thread(other_target.read_bytes)
+    await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
+    other_bytes = b"Owner's other manual document.\r\n"
+    await asyncio.to_thread(other_target.write_bytes, other_bytes)
     heading = "# Active Projects" if document == "projects" else "# User Preferences"
     # Projects already normalize the final newline. Keep that contract while
     # proving the interior LF/CRLF bytes survive an unchanged owner save.
@@ -106,6 +118,7 @@ async def test_private_profile_unchanged_save_preserves_line_endings(env, docume
         )
         assert saved.status == 200
         assert essentials.call_args.args[0] == "member-alice"
+        assert essentials.call_args.kwargs["member"] == "alice"
         assert essentials.call_args.kwargs["profile_overrides"] == {f"{document}.md": original}
         assert await asyncio.to_thread(target.read_bytes) == original.encode("utf-8")
         assert await asyncio.to_thread(other_target.read_bytes) == other_bytes
@@ -145,8 +158,7 @@ async def test_global_history_keeps_its_existing_aggregate_edit_contract(env, mo
 async def test_private_history_rechecks_exact_target_before_replacement(env, monkeypatch, change):
     store = await document_store(env, "member-alice")
     await asyncio.to_thread(store.append_history, "Clean initial entry")
-    today = store._today_history_file()
-    monkeypatch.setattr(store, "_today_history_file", lambda: today)
+    tier = env.tiers["member-alice"]
     original_write = store.write_today_history
     winner = b""
 
@@ -155,8 +167,11 @@ async def test_private_history_rechecks_exact_target_before_replacement(env, mon
         if change == "append":
             store.append_history("Concurrent consolidation sentinel")
         else:
-            today.write_text("Preserve AKIAIOSFODNN7EXAMPLE exactly", encoding="utf-8")
-        winner = today.read_bytes()
+            with tier.db:
+                tier._write_history(
+                    date.today().isoformat(), "Preserve AKIAIOSFODNN7EXAMPLE exactly", "test", ""
+                )
+        winner = tier.read_editable_history().encode("utf-8")
         return original_write(content, **kwargs)
 
     monkeypatch.setattr(store, "write_today_history", change_before_lock)
@@ -177,5 +192,6 @@ async def test_private_history_rechecks_exact_target_before_replacement(env, mon
         b"Concurrent consolidation sentinel" if change == "append" else b"AKIAIOSFODNN7EXAMPLE"
     )
     assert sentinel in winner
-    assert await asyncio.to_thread(today.read_bytes) == winner
+    assert (await asyncio.to_thread(tier.read_editable_history)).encode("utf-8") == winner
+    assert not store._history_dir.exists()
     assert "AKIAIOSFODNN7EXAMPLE" not in response.text

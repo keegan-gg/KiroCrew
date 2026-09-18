@@ -9,7 +9,6 @@ import importlib
 import importlib.util
 import inspect
 import json
-import logging
 import os
 import re
 import shutil
@@ -90,14 +89,11 @@ from kiro_crew.memory import MemoryStore
 from kiro_crew.memory_stores import (
     DEFAULT_MEMORY_STORE,
     UnknownMemoryStore,
-    archive_member_memory_store,
     memory_store_binding_defect,
     memory_store_namespace_lock,
     named_store_or_empty,
     persist_member_config,
     provision_member_memory,
-    retire_unpublished_member_memory_store,
-    rollback_member_memory_archive_if_active,
 )
 from kiro_crew.port_resolution import resolve_client_port_ex
 from kiro_crew.project_scope import scope_is_admissible, scope_selector_is_inadmissible
@@ -566,9 +562,8 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                         "choose another dir or remove it first"
                     ) from exc
                 install_state["installed"] = True
-            # A create with no copy source still needs its directory to EXIST (see
-            # materialize_workspace_dir: the config entry alone is a fleet-wide
-            # private-memory outage). Created through the pinned parent, adopting a
+            # A create with no copy source still needs a usable provider cwd and
+            # project document directory. Created through the pinned parent, adopting a
             # directory already there; deliberately NOT rolled back on a failed
             # write -- a concurrent create can already have adopted and registered it.
             else:
@@ -646,10 +641,9 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                     raise _CliConflict(
                         f"directory '{args.dir}' is already used by another workspace"
                     )
-                # Same materialize-or-refuse invariant the create path holds: the
-                # V2 private-memory layout resolves EVERY declared workspace
-                # strictly, so rebinding to a path that is not a directory arms a
-                # refusal for every private member. An update names a destination
+                # Same materialize-or-refuse invariant the create path holds:
+                # provider cwd and project documents need a usable directory.
+                # An update names a destination
                 # the owner already chose, so it refuses rather than creating one.
                 if not update_dst.is_dir():
                     raise _CliConflict(
@@ -1151,18 +1145,6 @@ def _finding_store_suffix(finding: dict) -> str:
     return f" (store {name})" if name else ""
 
 
-def _retire_failed_cli_member_allocation(cfg: KiroCrewConfig, name: str, prior_store: str) -> None:
-    try:
-        store = cfg.agents[name].memory_store
-        if store == prior_store:
-            return
-        retire_unpublished_member_memory_store(store, name)
-    except BaseException:
-        logging.getLogger(__name__).warning(
-            "Could not retire unpublished memory for member %s", name, exc_info=True
-        )
-
-
 def _handle_agent(args: argparse.Namespace) -> None:
     """Dispatch agent subcommands: list, create, update, delete."""
 
@@ -1190,7 +1172,7 @@ def _handle_agent(args: argparse.Namespace) -> None:
         memory_store = _memory_store_or_exit(args.memory_store)
         if memory_store not in ("", DEFAULT_MEMORY_STORE):
             print(
-                "Error: members receive an empty private memory store automatically",
+                "Error: members receive an empty member memory store automatically",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -1204,7 +1186,6 @@ def _handle_agent(args: argparse.Namespace) -> None:
             provision_member_memory(cfg, args.name)
             persist_member_config(cfg, args.name, create=True)
         except BaseException as exc:
-            _retire_failed_cli_member_allocation(cfg, args.name, memory_store)
             if not isinstance(exc, (OSError, UnknownMemoryStore)):
                 raise
             print(f"Error: {exc}", file=sys.stderr)
@@ -1218,18 +1199,13 @@ def _handle_agent(args: argparse.Namespace) -> None:
         agent = cfg.agents[args.name]
         prior_memory_store = agent.memory_store
         if args.memory_store is not None and args.memory_store != prior_memory_store:
-            print("Error: a member's private memory cannot be rebound or shared", file=sys.stderr)
+            print("Error: a member's memory cannot be rebound or shared", file=sys.stderr)
             sys.exit(1)
         if args.kiro_agent is not None:
             agent.kiro_agent = args.kiro_agent
         if args.workspace is not None:
             agent.workspace = args.workspace
         try:
-            if getattr(args, "provision_memory", False):
-                prior_record = cfg.memory_stores.get(prior_memory_store)
-                if prior_record is None or prior_record.memory_version != 2:
-                    require_member_memory_creation(args.name)
-                provision_member_memory(cfg, args.name)
             changed_fields = {
                 field
                 for field in ("kiro_agent", "workspace")
@@ -1244,7 +1220,6 @@ def _handle_agent(args: argparse.Namespace) -> None:
                 changed_fields=changed_fields,
             )
         except BaseException as exc:
-            _retire_failed_cli_member_allocation(cfg, args.name, prior_memory_store)
             if not isinstance(exc, (OSError, UnknownMemoryStore)):
                 raise
             print(f"Error: {exc}", file=sys.stderr)
@@ -1262,8 +1237,6 @@ def _handle_agent(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
 
-        created_archive: list[tuple[str, str]] = []
-
         def _mutate_agent_delete(doc: dict) -> dict:
             agents = coerce_dict_section(doc, "agents")
             if args.name not in agents:
@@ -1276,33 +1249,11 @@ def _handle_agent(args: argparse.Namespace) -> None:
                 isinstance(agent_section, dict) and agent_section.get("default_agent") == args.name
             ):
                 raise _CliConflict(f"cannot delete default agent '{args.name}'")
-            entry = agents[args.name]
-            stores = coerce_dict_section(doc, "memory_stores")
-            store_name = entry.get("memory_store", "") if isinstance(entry, dict) else ""
-            record = stores.get(store_name)
-            if isinstance(record, dict) and record.get("memory_version") == 2:
-                if record.get("owner_member") != args.name:
-                    raise _CliConflict(
-                        f"memory store '{store_name}' ownership changed concurrently"
-                    )
-                if archive_member_memory_store(store_name, args.name):
-                    created_archive.append((store_name, args.name))
             del agents[args.name]
             return doc
 
-        def _rollback_archive() -> None:
-            for store_name, owner in reversed(created_archive):
-                try:
-                    rollback_member_memory_archive_if_active(store_name, owner)
-                except Exception:
-                    logging.getLogger(__name__).error(
-                        "failed to roll back member memory retirement for %s",
-                        store_name,
-                        exc_info=True,
-                    )
-
         with memory_store_namespace_lock():
-            _locked_config_write(_mutate_agent_delete, cleanup_failure=_rollback_archive)
+            _locked_config_write(_mutate_agent_delete)
         print(f"Deleted agent: {args.name}")
 
     elif action == "reset-model":

@@ -21,8 +21,7 @@ from typing import Any, Callable, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.acp.types import JSONRPC_METHOD_NOT_FOUND
-from kiro_crew.config.loader import KiroCrewConfig, config_dir, read_local_secret
-from kiro_crew.dashboard.origin import parse_dashboard_url
+from kiro_crew.config.loader import config_dir, read_local_secret
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_caller import (
     CallerContext,
@@ -31,6 +30,7 @@ from kiro_crew.mcp_caller import (
     set_current_tenant_nonce,
     tenant_nonce_from_meta,
 )
+from kiro_crew.port_resolution import resolve_client_port_src
 from kiro_crew.sel import sel
 from kiro_crew.session_directive import neutralize_markers
 from kiro_crew.validation import (
@@ -69,18 +69,6 @@ def set_internal_caller(name: str | None) -> None:
 def internal_caller() -> str | None:
     """The declared component identity for internal HTTP requests, if any."""
     return _internal_caller_name
-
-
-def member_proof_header_value(proof: str) -> str:
-    """Return ``proof`` when it is safe to send as a header value, else ``""``.
-
-    A gateway-minted member proof is ASCII alphanumerics plus ``-_.``; anything
-    else (CR/LF, separators, non-ASCII) earns no header rather than a header
-    injection surface. One charset rule for every proof-forwarding client.
-    """
-    if proof and proof.isascii() and all(c.isalnum() or c in "-_." for c in proof):
-        return proof
-    return ""
 
 
 # Max tools/call requests buffered while a tool worker is busy.
@@ -290,8 +278,8 @@ _excluded_tools_by_session: dict[str, set[str]] = {}
 # Two separate negative caches with different TTLs so the long-TTL
 # HTTP-error path doesn't keep fail-open active when only a brief
 # startup race triggered the failure.
-_last_failure_time: float = 0.0           # gateway unreachable / non-404 HTTP error
-_last_startup_race_time: float = 0.0      # no session key or 404 — recovers fast
+_last_failure_time: float = 0.0  # gateway unreachable / non-404 HTTP error
+_last_startup_race_time: float = 0.0  # no session key or 404 — recovers fast
 _failure_count: int = 0
 # Long TTL applies only when the gateway is genuinely unreachable
 # (HTTP errors other than 404, connection refused, timeout).  Kept short
@@ -316,15 +304,13 @@ _STARTUP_RACE_CACHE_TTL: float = 5.0  # seconds
 _MAX_WARNING_FAILURES: int = 2
 
 
-def _resolve_excluded_tools(caller_session: str = "", *, member_memory_proof: str = "") -> set[str]:
+def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
     """Query the gateway for the current session's managedToolPolicy.exclude.
 
     ``caller_session`` is the verified per-call identity from the gateway's
     caller-meta extension (pooled topology); when non-empty it takes
-    precedence over the env/PID resolution below and keys the cache, so
+    precedence over the signed token and env/PID resolution below and keys the cache, so
     sessions sharing one backend cannot inherit each other's policy.
-    ``member_memory_proof`` belongs only to that request. It is forwarded to
-    the policy endpoint and is never retained in a policy or connection cache.
 
     Returns a set of tool names that should be hidden from this session.
     Caches the result on success only.  On failure:
@@ -346,7 +332,20 @@ def _resolve_excluded_tools(caller_session: str = "", *, member_memory_proof: st
        clients (Claude Code, custom MCP hosts) that skip disabledTools.
     """
     global _last_failure_time, _last_startup_race_time, _failure_count
-    _cached = _excluded_tools_by_session.get(caller_session)
+    session_key = caller_session
+    if not session_key:
+        from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
+        from kiro_crew.session_token_sig import verify_session_token
+
+        token = os.environ.get(STUB_SESSION_TOKEN_ENV, "")
+        if token:
+            try:
+                session_key = verify_session_token(token)
+            except Exception:
+                # Match the ordinary MCP resolver's unavailable-token fallback.
+                pass
+        session_key = session_key or os.environ.get("KIROCREW_SESSION_KEY", "")
+    _cached = _excluded_tools_by_session.get(session_key)
     if _cached is not None:
         return _cached
 
@@ -360,13 +359,10 @@ def _resolve_excluded_tools(caller_session: str = "", *, member_memory_proof: st
     # race by definition, so honoring the global short window for it would
     # fail-open an identified pooled session on another session's race
     # — skip it when caller_session is present.
-    if (
-        (_last_failure_time and (now - _last_failure_time) < _NEGATIVE_CACHE_TTL)
-        or (
-            not caller_session
-            and _last_startup_race_time
-            and (now - _last_startup_race_time) < _STARTUP_RACE_CACHE_TTL
-        )
+    if (_last_failure_time and (now - _last_failure_time) < _NEGATIVE_CACHE_TTL) or (
+        not caller_session
+        and _last_startup_race_time
+        and (now - _last_startup_race_time) < _STARTUP_RACE_CACHE_TTL
     ):
         sel().log_api_access(
             caller=caller_session or os.environ.get("KIROCREW_SESSION_KEY", "mcp"),
@@ -377,8 +373,7 @@ def _resolve_excluded_tools(caller_session: str = "", *, member_memory_proof: st
         return set()
 
     try:
-        cfg = KiroCrewConfig.load()
-        _host, port = parse_dashboard_url(cfg.dashboard.url)
+        port, _source = resolve_client_port_src(None)
         api_base = f"http://localhost:{port}"
 
         # Credential for the port this function DIALS (parsed just above), not for
@@ -390,15 +385,9 @@ def _resolve_excluded_tools(caller_session: str = "", *, member_memory_proof: st
         except Exception:
             pass
 
-        # Resolve session key: the verified per-call caller identity wins
-        # (pooled topology); env/PID resolution is the single-session path.
-        from kiro_crew.member_memory_auth import protected_member_session_for_pid
-
-        protected = None if caller_session else protected_member_session_for_pid(os.getpid())
-        session_key = caller_session or (
-            protected if protected is not None else os.environ.get("KIROCREW_SESSION_KEY", "")
-        )
-        if not session_key and protected is None:
+        # The per-call identity and signed per-session token were resolved above
+        # the cache; a warm rekey must not reuse the previous session's policy.
+        if not session_key:
 
             def _ppid_via_libproc(pid: int) -> int:
                 """macOS parent-PID via libproc proc_pidinfo (no exec, sandbox-safe)."""
@@ -408,8 +397,11 @@ def _resolve_excluded_tools(caller_session: str = "", *, member_memory_proof: st
                     libproc = ctypes.CDLL("libproc.dylib", use_errno=True)
                     libproc.proc_pidinfo.restype = ctypes.c_int
                     libproc.proc_pidinfo.argtypes = [
-                        ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
-                        ctypes.c_void_p, ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_uint64,
+                        ctypes.c_void_p,
+                        ctypes.c_int,
                     ]
                     buf = ctypes.create_string_buffer(buf_size)
                     n = libproc.proc_pidinfo(pid, proc_pidtbsdinfo, 0, buf, buf_size)
@@ -485,14 +477,11 @@ def _resolve_excluded_tools(caller_session: str = "", *, member_memory_proof: st
             )
             return set()
 
+        _cached = _excluded_tools_by_session.get(session_key)
+        if _cached is not None:
+            return _cached
         headers: dict[str, str] = {"X-Internal-Secret": secret}
         headers["X-Session-Key"] = session_key
-        proof_value = member_proof_header_value(member_memory_proof) if caller_session else ""
-        if proof_value:
-            from kiro_crew.member_memory_auth import PROOF_HEADER
-
-            headers[PROOF_HEADER] = proof_value
-
         req = urllib.request.Request(
             f"{api_base}/api/session-tool-policy",
             headers=headers,
@@ -529,10 +518,8 @@ def _resolve_excluded_tools(caller_session: str = "", *, member_memory_proof: st
         # FIFO bound: dicts preserve insertion order; drop the oldest
         # session's entry when full (pooled backends serve churning sessions).
         while len(_excluded_tools_by_session) >= _EXCLUDED_TOOLS_CACHE_MAX:
-            _excluded_tools_by_session.pop(
-                next(iter(_excluded_tools_by_session))
-            )
-        _excluded_tools_by_session[caller_session] = resolved
+            _excluded_tools_by_session.pop(next(iter(_excluded_tools_by_session)))
+        _excluded_tools_by_session[session_key] = resolved
         return resolved
     except Exception as exc:
         # Policy call failed (network error, timeout, non-404 HTTP) —
@@ -633,6 +620,27 @@ def respond(req_id: Any, result: Any, error: dict | None = None) -> None:
         sys.stdout.flush()
 
 
+_SESSION_BODY_TOOLS = frozenset(
+    {
+        "memory_recall",
+        "search_chat_history",
+        "learn_add",
+        "spawn_run",
+        "spawn_continue",
+        "spawn_steer",
+        "spawn_sub_agents",
+        "session_send",
+        "register_hook",
+        "task_run",
+        "workflow_author",
+        "workflow_run",
+        "workflow_rerun_subtree",
+        "cron_add",
+        "cron_update",
+    }
+)
+
+
 def call_tool_with_logging(
     name: str,
     raw_args: dict[str, Any],
@@ -642,6 +650,7 @@ def call_tool_with_logging(
     downstream_service: str,
 ) -> str:
     """Validate args, call inner tool function, and log the invocation."""
+    retain_payload = name not in _SESSION_BODY_TOOLS
     try:
         args = validate_fn(name, raw_args)
     except ValidationError as e:
@@ -660,7 +669,7 @@ def call_tool_with_logging(
             tool_name=name,
             outcome="failed",
             downstream_service=downstream_service,
-            error=str(e),
+            error=str(e) if retain_payload else "Invalid session tool request",
         )
         # A rejection is BY CONSTRUCTION not a directive, and this message
         # interpolates content this process does not control: an unknown-field
@@ -681,7 +690,9 @@ def call_tool_with_logging(
     # canonical context-aware shim (defense-in-depth for every tool, not just
     # the ones a handler happened to scrub).
     resources = ""
-    if args:
+    # Audit attribution and outcomes without retaining queries or session bodies,
+    # including rejected writes and calls from shared MCP processes.
+    if args and retain_payload:
         from kiro_crew.platform import redact_via_context
 
         resources = redact_via_context(json.dumps(args))[:500]
@@ -693,7 +704,11 @@ def call_tool_with_logging(
         outcome=outcome,
         downstream_service=downstream_service,
         resources=resources,
-        error=result[:500] if outcome == "failed" else "",
+        error=(
+            (result[:500] if retain_payload else "Session tool failed")
+            if outcome == "failed"
+            else ""
+        ),
     )
     return result
 
@@ -859,9 +874,7 @@ def _run_stdio_dispatch_loop(
                 ids.add(str(_pcid))
         return ids
 
-    def _sel_audit(
-        outcome: str, tool_name: str, req_id: Any, session_key: str = ""
-    ) -> None:
+    def _sel_audit(outcome: str, tool_name: str, req_id: Any, session_key: str = "") -> None:
         """Emit a SEL audit event for a tool invocation outcome.
 
         ``session_key`` should be the request's parsed caller identity when
@@ -874,8 +887,7 @@ def _run_stdio_dispatch_loop(
         failures are logged, never bare pass)."""
         try:
             sel().log_tool_invocation(
-                session_key=session_key
-                or os.environ.get("KIROCREW_SESSION_KEY", "mcp"),
+                session_key=session_key or os.environ.get("KIROCREW_SESSION_KEY", "mcp"),
                 source="mcp",
                 tool_name=tool_name,
                 tool_kind=server_name,
@@ -885,7 +897,10 @@ def _run_stdio_dispatch_loop(
         except Exception as sel_exc:
             logger.warning(
                 "SEL audit failed for %s tool %s (request %s): %s",
-                outcome, tool_name, req_id, sel_exc,
+                outcome,
+                tool_name,
+                req_id,
+                sel_exc,
             )
 
     def _req_caller(request: dict) -> "CallerContext | None":
@@ -900,10 +915,6 @@ def _run_stdio_dispatch_loop(
         return ctx.session_key if ctx is not None else ""
 
     def _caller_excluded_tools(caller: "CallerContext | None") -> set[str]:
-        if caller is not None and caller.from_gateway and caller.member_memory_proof:
-            return _resolve_excluded_tools(
-                caller.session_key, member_memory_proof=caller.member_memory_proof
-            )
         return _resolve_excluded_tools(caller.session_key if caller else "")
 
     def _run_tool(
@@ -919,8 +930,7 @@ def _run_stdio_dispatch_loop(
         # Inject cancel event into thread-local so cooperative tools can check it
         _thread_cancel_event = cancel_evt
         # Install the verified per-call caller for identity resolvers. Safe as
-        # a module slot: dispatch is strictly sequential (one worker at a
-        # time, joined before the next dispatch).
+        # a ContextVar: simultaneous calls cannot inherit another caller.
         set_current_caller(caller_ctx)
         # And the connection's namespace separator, which is present even when
         # the caller is not: a tool that keys per-tenant state for a caller the
@@ -1084,11 +1094,11 @@ def _run_stdio_dispatch_loop(
                     # Boxed result dropped due to cancellation (cancel arrived
                     # after the worker delivered) -- audit it.
                     _sel_audit(
-                                "cancelled",
-                                _current_tool_name,
-                                _current_req_id,
-                                _current_caller_key,
-                            )
+                        "cancelled",
+                        _current_tool_name,
+                        _current_req_id,
+                        _current_caller_key,
+                    )
                 _result_box.clear()
                 # Consumed: drop the id so a completed request never lingers
                 # in the cancelled set.
@@ -1234,9 +1244,7 @@ def _run_stdio_dispatch_loop(
                 _cancel_event = threading.Event()
                 _current_req_id = req_id
                 _current_tool_name = tool_name
-                _current_caller_key = (
-                    _caller_ctx.session_key if _caller_ctx else ""
-                )
+                _current_caller_key = _caller_ctx.session_key if _caller_ctx else ""
                 _worker_audited[0] = False
                 _result_ready.clear()
                 _result_box.clear()

@@ -29,21 +29,22 @@ logger = logging.getLogger(__name__)
 
 
 async def _private_caller_refusal(request: web.Request) -> web.Response | None:
-    """The private-member gate in front of the session-control routes.
+    """The execution-scope gate in front of the session-control routes.
 
     Runs only on the authenticated strict-internal branch (``internal_auth`` is
-    ``True``). Resolves the caller's private authority ONCE via
+    ``True``). Captures the caller's canonical execution scope ONCE off-loop via
     :func:`internal_memory_scope`:
 
-    * a verification failure returns that refusal verbatim
-      (``member_session_unverified``);
+    * a capture failure returns that refusal verbatim
+      (``member_identity_unavailable`` 409 for an unavailable or mismatched
+      identity); ordinary transport/auth refusals retain their own status;
     * an owner / Global-V1 caller (``scope is None``) falls through to the
       handler, exactly as the surface behaved before member dispatch existed;
-    * a verified private V2 caller is admitted ONLY when it is a crew-member DM
+    * a scoped caller is admitted ONLY when it is a crew-member DM
       slot (``member-*`` session key) AND the surface is reachable for it — the
       member operating model, gated the rest of the way by
-      ``session_control.py``'s own creator-ownership fence. Every other private
-      V2 caller gets the ``member_scope_denied`` refusal.
+      ``session_control.py``'s own creator-ownership fence. Every other scoped
+      caller gets the ``member_scope_denied`` 403 refusal.
 
     Reachable means ``member_dispatch_enabled()`` OR ``session_control_enabled()``
     is true, mirroring ``session_control.py``'s ``_member_bypass`` contract: the
@@ -63,9 +64,9 @@ async def _private_caller_refusal(request: web.Request) -> web.Response | None:
     if refusal is not None:
         return refusal
     if scope is None:
-        # Owner / Global-V1 caller: not a private surface, so nothing to refuse.
+        # Owner / Global-V1 caller: no store scope, so nothing to refuse here.
         return None
-    # A verified private V2 caller. Admit ONLY a member DM slot while the surface
+    # A scoped caller. Admit ONLY a member DM slot while the surface
     # is reachable for it: the member's own ``member_dispatch`` bypass OR the
     # global ``session_control`` switch it otherwise falls back under, since
     # ``member_dispatch`` is a bypass ON TOP of the switch, not a replacement.
@@ -105,7 +106,7 @@ async def _require_internal(request: web.Request) -> web.Response | None:
     non-loopback reclassification in one check. Returns the refusal, or ``None``
     when the caller is authentic.
 
-    A private crew-member DM slot is the ONE verified V2 caller admitted here
+    A crew-member DM slot is the ONE kind of scoped caller admitted here
     rather than refused: dispatching work into worker sessions it creates is the
     member operating model, so the surface lets it through to
     ``session_control.py``, where the SAME ownership fence every member caller is
@@ -113,8 +114,8 @@ async def _require_internal(request: web.Request) -> web.Response | None:
     agent-workspace check) does the real gating. The admission is bounded by the
     surface being reachable for a member — its own ``agent.member_dispatch``
     bypass, OR the global ``agent.session_control`` switch it otherwise falls
-    back under. With both off the member is refused here like any other private
-    caller. Every OTHER verified V2 caller (an ordinary private member) keeps the
+    back under. With both off the member is refused here like any other scoped
+    caller. Every OTHER scoped caller keeps the
     ``member_scope_denied`` refusal, and an owner / Global-V1 caller falls through
     exactly as before.
     """

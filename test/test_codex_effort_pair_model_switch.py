@@ -452,7 +452,6 @@ class TestPersistedPairAndSlotEffortAgree:
             provider = AcpProvider(acp_backend=ACP_BACKEND_CODEX)
         provider._client = client
         provider._effort_per_model = {"openai.gpt-6-astra[max]": "high"}
-        provider._private_memory_prepared = True
 
         await provider.start()
 
