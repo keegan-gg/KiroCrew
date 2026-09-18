@@ -93,7 +93,7 @@ async def test_kill_untracks_only_the_descendants_that_died(monkeypatch):
     # 700 escaped the killpg (its own setsid); 800 went down with the group.
     monkeypatch.setattr(rt, "_pid_gone_or_unmanaged", lambda pid: pid == 800)
     untracked: list[dict] = []
-    monkeypatch.setattr(rt, "_untrack_child_pids", untracked.append)
+    monkeypatch.setattr(rt, "_untrack_child_pids", lambda d, **k: untracked.append(d))
 
     await r.kill()
 
@@ -110,11 +110,132 @@ async def test_kill_prunes_descendants_even_when_the_root_survives(monkeypatch):
     monkeypatch.setattr(rt.platform_compat, "pid_exists", lambda pid: True)
     monkeypatch.setattr(rt, "_pid_gone_or_unmanaged", lambda pid: True)
     untracked: list[dict] = []
-    monkeypatch.setattr(rt, "_untrack_child_pids", untracked.append)
+    monkeypatch.setattr(rt, "_untrack_child_pids", lambda d, **k: untracked.append(d))
 
     await r.kill()
 
     assert [sorted(d) for d in untracked] == [[900]]
+
+
+@pytest.mark.asyncio
+async def test_kill_signals_the_group_when_the_root_is_already_gone(monkeypatch):
+    """The leak that survives descendant tracking: a root that died before any
+    descendant was recorded.
+
+    kill_process_tree is killpg(getpgid(root)); getpgid raises once the root has
+    exited, and swallowing that leaves the launcher, agent and chat process in
+    the group unsignalled. The group id is known without the root -- it was a
+    session leader -- so the teardown must still reach it, and escalate, once a
+    live member vouches for it.
+    """
+    r = _bare_runtime()
+
+    # The autouse fixture zeroes the grace, and wait_for(..., 0) times out before
+    # even a finished wait() is read; a dead root's wait() must be SEEN to return,
+    # so give this test the real ordering with a small non-zero grace.
+    monkeypatch.setattr(rt.AcpRuntime, "_KILL_TERM_TIMEOUT", 1.0)
+
+    async def _already_exited() -> int:
+        return -9  # a dead root's wait() returns at once
+
+    r._process.wait = _already_exited
+
+    def _root_gone(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(rt.platform_compat, "kill_process_tree", _root_gone)
+    monkeypatch.setattr(rt.platform_compat, "pid_exists", lambda pid: False)
+    monkeypatch.setattr(rt, "_untrack_pid", lambda pid: None)
+    monkeypatch.setattr(rt, "_untrack_session_pid", lambda pid: None)
+    signalled: list[tuple[int, int]] = []
+
+    def _group(pgid, sig):
+        signalled.append((pgid, sig))
+        return 2  # two vouching members
+
+    monkeypatch.setattr(rt, "_signal_orphaned_runtime_group", _group)
+    slept: list[float] = []
+
+    async def _sleep(secs):
+        slept.append(secs)
+
+    monkeypatch.setattr(rt.asyncio, "sleep", _sleep)
+
+    await r.kill()
+
+    # SIGTERM to the group, the same grace a live tree gets, then SIGKILL to it.
+    assert signalled == [
+        (54321, rt.platform_compat.SIGTERM),
+        (54321, rt.platform_compat.SIGKILL),
+    ]
+    assert slept == [rt.AcpRuntime._KILL_TERM_TIMEOUT]
+
+
+@pytest.mark.asyncio
+async def test_kill_does_not_escalate_when_no_member_vouches(monkeypatch):
+    """A reaped root whose group has nothing of ours left is simply gone.
+
+    No vouching member means no signal was sent, so no grace is owed and the
+    SIGKILL escalation must not run against a number that may now be a
+    stranger's.
+    """
+    r = _bare_runtime()
+
+    # The autouse fixture zeroes the grace, and wait_for(..., 0) times out before
+    # even a finished wait() is read; a dead root's wait() must be SEEN to return,
+    # so give this test the real ordering with a small non-zero grace.
+    monkeypatch.setattr(rt.AcpRuntime, "_KILL_TERM_TIMEOUT", 1.0)
+
+    async def _already_exited() -> int:
+        return -9
+
+    r._process.wait = _already_exited
+
+    def _root_gone(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(rt.platform_compat, "kill_process_tree", _root_gone)
+    monkeypatch.setattr(rt.platform_compat, "pid_exists", lambda pid: False)
+    monkeypatch.setattr(rt, "_untrack_pid", lambda pid: None)
+    monkeypatch.setattr(rt, "_untrack_session_pid", lambda pid: None)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        rt, "_signal_orphaned_runtime_group", lambda pgid, sig: calls.append(sig) or 0
+    )
+    slept: list[float] = []
+
+    async def _sleep(secs):
+        slept.append(secs)
+
+    monkeypatch.setattr(rt.asyncio, "sleep", _sleep)
+
+    await r.kill()
+
+    assert calls == [rt.platform_compat.SIGTERM]
+    assert slept == []
+
+
+@pytest.mark.asyncio
+async def test_kill_treats_a_denied_signal_as_final(monkeypatch):
+    """Only a reaped root reaches the group fallback.
+
+    An OSError that is not ProcessLookupError -- EPERM through a launcher
+    wrapper -- says the root is THERE and we may not signal it; guessing at its
+    group from the pid would be signalling something we were just refused.
+    """
+    r = _bare_runtime()
+
+    def _denied(pid, sig):
+        raise PermissionError
+
+    monkeypatch.setattr(rt.platform_compat, "kill_process_tree", _denied)
+    monkeypatch.setattr(rt.platform_compat, "pid_exists", lambda pid: True)
+    group = MagicMock(return_value=1)
+    monkeypatch.setattr(rt, "_signal_orphaned_runtime_group", group)
+
+    await r.kill()
+
+    group.assert_not_called()
 
 
 @pytest.mark.asyncio

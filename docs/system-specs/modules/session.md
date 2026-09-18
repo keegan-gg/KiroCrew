@@ -2031,7 +2031,19 @@ liveness, never by the root's fate: `AcpClient._reset_state()` and
 children confirmed gone and log the survivors at WARNING.  A child that
 escaped the group kill by calling `setsid` keeps its entry, because that entry
 is the only handle the periodic sweep and the next startup cleanup have on it.
+Both pass their root to `_untrack_child_pids(pids, parent_pid=<root>)`, which
+then removes only that root's `child:parent` lines: a child pid is reused like
+any other number, and another live runtime may have recorded it under ITS root
+in the meantime — removing by child pid alone would take that line too.
 If the gateway crashes, the entries remain in the file for the next startup.
+
+A root that is already gone when teardown runs is handled on the runtime path
+by `AcpRuntime._signal_tree` → `_signal_orphaned_runtime_group`: the group id
+is the root pid (a session leader), and the group is signalled once
+`_marked_group_members` finds a live member carrying `KIROCREW_SPAWNED` with a
+runtime argv identity.  This is the tree the snapshot cannot cover — a root
+that died before its first scan — and the tracked sweep cannot either, since
+nothing was recorded.  Linux only; see [acp-client](acp-client.md).
 
 **Detection**: reads `kiro_pids.txt`, processes only `child:parent` lines
 (bare PID lines are kiro-cli parents handled by `cleanup_orphaned_sessions()`).

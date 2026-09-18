@@ -998,6 +998,87 @@ def _pgroup_has_member_besides(pgid: int, root_pid: int) -> bool:
     return False
 
 
+def _marked_group_members(pgid: int) -> list[int]:
+    """Live members of process group *pgid* that carry the spawn marker.
+
+    The proof a teardown needs once the group's LEADER is gone. A leader spawned
+    with ``start_new_session=True`` names its group by its own pid, so the number
+    survives the leader -- but a bare number is what a recycled pid looks like
+    too, and ``killpg`` on it would take a stranger's tree. A member that carries
+    ``KIROCREW_SPAWNED`` in its exec-time environment is the positive identity
+    that a group is one Kiro Crew spawned; a detached survivor that merely
+    inherited the marker is excluded by the argv identity check, the same pair
+    the tracked sweep's systemd arm requires.
+
+    Linux only. The environ read is Linux-only and fail-closed everywhere else,
+    so the answer is ``[]`` on macOS and Windows and the caller signals nothing
+    -- a missed reap there, never a wrong kill. Zombies are skipped: they hold
+    no memory and cannot be signalled into exiting.
+    """
+    if sys.platform != "linux" or pgid <= 1:
+        return []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    members: list[int] = []
+    for entry in entries:
+        name = entry.name
+        if not name.isdigit():
+            continue
+        member = int(name)
+        try:
+            stat = (entry / "stat").read_text()
+        except (OSError, ValueError):
+            continue
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            continue
+        fields = stat[rparen + 2 :].split()
+        try:
+            if int(fields[2]) != pgid or fields[0] == "Z":
+                continue
+        except (IndexError, ValueError):
+            continue
+        if _env_has_kirocrew_marker(member) and _tracked_child_has_runtime_identity(member):
+            members.append(member)
+    return members
+
+
+def _signal_orphaned_runtime_group(pgid: int, sig: int) -> int:
+    """``killpg`` a runtime's group after its leader has been reaped, if it is ours.
+
+    The kill path that signals a live tree is ``killpg(getpgid(root))``, and it
+    has a hole exactly where the leak lives: ``getpgid`` raises once the root has
+    exited, the caller reads that as "already dead", and the launcher, agent and
+    chat processes left in the group are never signalled. They reparent to init
+    holding their memory, and if the root died before any descendant was
+    recorded there is no tracking entry to find them by either.
+
+    So resolve the group from the contract instead of from the dead pid -- the
+    root was a session leader, so ``pgid == root pid`` -- and signal it once
+    :func:`_marked_group_members` vouches that at least one live member is a
+    Kiro Crew runtime. No vouching member means no signal: the number may have
+    moved on to a stranger's tree, and declining to act costs a leak the sweep
+    still reports, where acting costs an unrelated process.
+
+    Returns the number of vouching members at the time of the signal, so the
+    caller can tell "nothing to reap" from "reaped" and decide on escalation.
+    ``ProcessLookupError`` from ``killpg`` -- the group emptied between the walk
+    and the signal -- counts as nothing to reap.
+    """
+    if platform_compat.IS_WINDOWS or pgid <= 1 or pgid == os.getpgrp():
+        return 0
+    members = _marked_group_members(pgid)
+    if not members:
+        return 0
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return 0
+    return len(members)
+
+
 def _provider_tree_gone(
     pid: int, pgid: int | None, records: dict[int, _ProviderChildRecord]
 ) -> bool:
@@ -1961,19 +2042,33 @@ def _replace_child_pids(
         return _rewrite_pid_file(path, "\n".join(kept) + "\n" if kept else "")
 
 
-def _untrack_child_pids(pids: Mapping[int, object]) -> None:
-    """Remove descendant PIDs from the tracking file."""
+def _untrack_child_pids(pids: Mapping[int, object], parent_pid: int = 0) -> None:
+    """Remove descendant PIDs from the tracking file.
+
+    With *parent_pid*, only this parent's ``child:parent`` lines are removed.
+    A child pid is reused like any other number, and another live runtime can
+    have recorded the same number under ITS root in the meantime; removing by
+    child pid alone would take that runtime's line with ours and leave its
+    descendant untracked. Both teardown callers know their root, so both pass
+    it. ``0`` keeps the pid-only match for a caller that has no root to name.
+    """
     if not pids:
         return
     to_remove = {str(p) for p in pids}
+    owner = str(parent_pid) if parent_pid else None
+
+    def _drop(entry: str) -> bool:
+        fields = entry.split(":")
+        if len(fields) < 2 or fields[0] not in to_remove:
+            return False
+        return owner is None or fields[1] == owner
+
     with _pid_file_lock():
         path = _pid_file_path()
         if not path.exists():
             return
         lines = path.read_text(encoding="utf-8").splitlines()
-        lines = [
-            ln for ln in lines if ":" not in ln.strip() or ln.strip().split(":")[0] not in to_remove
-        ]
+        lines = [ln for ln in lines if not _drop(ln.strip())]
         _rewrite_pid_file(path, "\n".join(lines) + "\n" if lines else "")
 
 

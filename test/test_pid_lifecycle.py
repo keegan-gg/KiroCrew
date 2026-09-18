@@ -146,6 +146,35 @@ class TestTrackUntrack:
         lines = pid_file.read_text(encoding="utf-8").strip().splitlines()
         assert lines == ["200:999"]
 
+    def test_untrack_child_pids_scoped_to_a_parent_keeps_another_parents_line(
+        self, pid_file: Path
+    ) -> None:
+        """A child pid is reused like any other number.
+
+        Another live runtime can have recorded the same number under ITS root
+        since ours exited; removing by child pid alone would take that line too
+        and leave its descendant untracked.
+        """
+        from kiro_crew.session_pid import _track_child_pids, _untrack_child_pids
+
+        with patch("kiro_crew.session_pid._pid_start_token", return_value=None):
+            _track_child_pids({100: None}, parent_pid=999)
+            _track_child_pids({100: None}, parent_pid=888)  # the number, reused
+        _untrack_child_pids({100: None}, parent_pid=999)
+        lines = pid_file.read_text(encoding="utf-8").strip().splitlines()
+        assert lines == ["100:888"]
+
+    def test_untrack_child_pids_without_a_parent_keeps_the_pid_only_match(
+        self, pid_file: Path
+    ) -> None:
+        from kiro_crew.session_pid import _track_child_pids, _untrack_child_pids
+
+        with patch("kiro_crew.session_pid._pid_start_token", return_value=None):
+            _track_child_pids({100: None}, parent_pid=999)
+            _track_child_pids({100: None}, parent_pid=888)
+        _untrack_child_pids({100: None})
+        assert pid_file.read_text(encoding="utf-8").strip() == ""
+
     def test_untrack_child_pids_preserves_bare_pid(self, pid_file: Path) -> None:
         """Untracking child PIDs must not remove bare PID lines (kiro-cli parents)."""
         from kiro_crew.session_pid import _track_child_pids, _track_pid, _untrack_child_pids
@@ -255,6 +284,116 @@ class TestTrackUntrack:
         from kiro_crew.session_pid import _replace_child_pids
 
         assert _replace_child_pids({200: ("t", b"x")}, parent_pid=0) is False
+
+
+class TestSignalOrphanedRuntimeGroup:
+    """killpg on a group whose leader is gone, only once a member vouches."""
+
+    def test_signals_the_group_when_a_member_vouches(self, monkeypatch) -> None:
+        from kiro_crew import session_pid as sp
+
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid: [101, 102])
+        sent: list[tuple[int, int]] = []
+        monkeypatch.setattr(sp.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+
+        assert sp._signal_orphaned_runtime_group(100, 15) == 2
+        assert sent == [(100, 15)]
+
+    def test_no_vouching_member_sends_nothing(self, monkeypatch) -> None:
+        """The number may belong to a stranger's tree by now."""
+        from kiro_crew import session_pid as sp
+
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid: [])
+        killpg = MagicMock()
+        monkeypatch.setattr(sp.os, "killpg", killpg)
+
+        assert sp._signal_orphaned_runtime_group(100, 15) == 0
+        killpg.assert_not_called()
+
+    def test_a_group_that_emptied_under_us_counts_as_nothing(self, monkeypatch) -> None:
+        from kiro_crew import session_pid as sp
+
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid: [101])
+
+        def _gone(pgid, sig):
+            raise ProcessLookupError
+
+        monkeypatch.setattr(sp.os, "killpg", _gone)
+        assert sp._signal_orphaned_runtime_group(100, 15) == 0
+
+    @pytest.mark.parametrize("pgid", [0, 1])
+    def test_refuses_a_broadcast_group(self, monkeypatch, pgid) -> None:
+        """killpg(1) is kill(-1): every process this uid owns."""
+        from kiro_crew import session_pid as sp
+
+        members = MagicMock(return_value=[101])
+        monkeypatch.setattr(sp, "_marked_group_members", members)
+        killpg = MagicMock()
+        monkeypatch.setattr(sp.os, "killpg", killpg)
+
+        assert sp._signal_orphaned_runtime_group(pgid, 15) == 0
+        members.assert_not_called()
+        killpg.assert_not_called()
+
+    def test_refuses_our_own_group(self, monkeypatch) -> None:
+        from kiro_crew import session_pid as sp
+
+        killpg = MagicMock()
+        monkeypatch.setattr(sp.os, "killpg", killpg)
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid: [101])
+
+        assert sp._signal_orphaned_runtime_group(sp.os.getpgrp(), 15) == 0
+        killpg.assert_not_called()
+
+
+class TestMarkedGroupMembers:
+    """The vouching read: which live members of a group are ours."""
+
+    @staticmethod
+    def _fake_proc(tmp_path: Path, rows: dict[int, tuple[str, int]]) -> Path:
+        """rows: pid -> (state, pgrp). Writes a minimal /proc/<pid>/stat each."""
+        for pid, (state, pgrp) in rows.items():
+            d = tmp_path / str(pid)
+            d.mkdir()
+            # pid (comm) state ppid pgrp ...
+            (d / "stat").write_text(f"{pid} (x) {state} 1 {pgrp} 0 0 0 0 0", encoding="utf-8")
+        (tmp_path / "self").mkdir()  # a non-digit entry, skipped
+        return tmp_path
+
+    def test_only_live_marked_members_of_the_group_count(self, tmp_path, monkeypatch) -> None:
+        from kiro_crew import session_pid as sp
+
+        if sys.platform != "linux":
+            pytest.skip("reads /proc")
+        root = self._fake_proc(
+            tmp_path,
+            {
+                101: ("S", 100),  # ours, live
+                102: ("Z", 100),  # ours, but a zombie
+                103: ("S", 100),  # in the group, no marker
+                104: ("S", 200),  # another group
+            },
+        )
+        monkeypatch.setattr(sp, "Path", lambda p="/proc": root if p == "/proc" else Path(p))
+        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid: pid in (101, 102))
+        monkeypatch.setattr(sp, "_tracked_child_has_runtime_identity", lambda pid: True)
+
+        assert sp._marked_group_members(100) == [101]
+
+    def test_a_marked_member_without_runtime_identity_does_not_vouch(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A detached survivor that merely inherited the marker."""
+        from kiro_crew import session_pid as sp
+
+        if sys.platform != "linux":
+            pytest.skip("reads /proc")
+        root = self._fake_proc(tmp_path, {101: ("S", 100)})
+        monkeypatch.setattr(sp, "Path", lambda p="/proc": root if p == "/proc" else Path(p))
+        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid: True)
+        monkeypatch.setattr(sp, "_tracked_child_has_runtime_identity", lambda pid: False)
+
+        assert sp._marked_group_members(100) == []
 
 
 class TestCleanupOrphanedMcpServers:

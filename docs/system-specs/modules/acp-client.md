@@ -1267,6 +1267,24 @@ reparented to init and unreachable. Teardown prunes by descendant liveness and
 retains survivors for the orphan sweep. See
 [session](session.md) for the file formats and the sweeps that read them.
 
+**A reaped root does not end the teardown.** `kill_process_tree` is
+`killpg(getpgid(pid))`, and `getpgid` raises once the root has exited — read as
+"already dead", that leaves the launcher's children, the agent and its chat
+process unsignalled in the group, and a root that died a few seconds into its
+life predates every descendant snapshot, so nothing else can find them either.
+`AcpRuntime._signal_tree` therefore treats `ProcessLookupError` from the tree
+kill as the START of a second path, not the end: the root was spawned as a
+session leader, so its pid IS the group id, and
+`session_pid._signal_orphaned_runtime_group` signals that group once
+`_marked_group_members` vouches that a live member carries the
+`KIROCREW_SPAWNED` marker AND a runtime argv identity. No vouching member, no
+signal — the number may be a stranger's by now. A vouched signal is followed by
+the same grace a live tree gets and a group `SIGKILL`, since the root's `wait()`
+returned at once and drove no escalation. Any other `OSError` (a denied signal)
+is final: the root is there and may not be signalled, so its group is not
+guessed at. The vouching read is Linux-only (the environ read is), so macOS and
+Windows keep the missed reap rather than gain a wrong kill.
+
 **An ownerless server→client request is answered ONCE, at connection level.**
 An inbound frame carrying an `id` **and** a `method` but no `params.sessionId`
 is a request that names no session — it expects exactly one response, so the
