@@ -1371,9 +1371,9 @@
       "title": "Command Bar",
       "action_failed": "Could not complete {{action}}. Press Enter to try again.",
       "working": "Working…",
-      "other_search_hint": "To search knowledge, artifacts, skills or prompts, disable Command Bar in the App Store — this launcher reaches sessions only",
+      "other_search_hint": "To search knowledge, skills or prompts, disable Command Bar in the App Store — this launcher reaches sessions and artifacts only",
       "cmd_toggle_theme": "Toggle Theme",
-      "search_failed": "Search failed",
+      "search_failed": "Search failed. Try again.",
       "retry": "Retry",
       "action_enter": "Open View",
       "action_continue": "Continue",
@@ -1399,7 +1399,14 @@
       "argument_withdrawn": "That command is no longer available.",
       "argument_changed": "This command changed. Check what will be sent, then press Enter again.",
       "will_send": "Will send",
-      "will_send_clipped": "Scroll to read the rest — this instruction continues below."
+      "will_send_clipped": "Scroll to read the rest — this instruction continues below.",
+      "cmd_search_artifacts": "Search Artifacts",
+      "action_open_artifact": "Open Artifact",
+      "placeholder_artifacts": "Search artifacts by name…",
+      "no_artifact_match_show_recent": "No artifacts match “{{query}}” — show recent instead",
+      "no_artifacts_yet": "No artifacts yet. Save a widget or document from a chat and it shows up here.",
+      "group_recent": "Recent",
+      "cmd_search_artifacts_sub": "Charts, documents and widgets you saved."
     },
     "papyrus": {
       "workspace": {

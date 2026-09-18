@@ -444,7 +444,7 @@ describe('CommandBarOverlay rows', () => {
     expect(src).toContain('shrink-0 w-[13px] flex justify-end')
   })
 
-  it('reports a failed session search as a row, not a paragraph with a button', async () => {
+  it('reports a failed session search through ErrorNotice with a separate retry row', async () => {
     // A rejected search leaves `data` undefined, which by row count alone looks
     // identical to an empty result -- so the empty copy would tell the user their
     // session does not exist. That is the one state that lies.
@@ -457,11 +457,16 @@ describe('CommandBarOverlay rows', () => {
     mount()
     fireEvent.mouseDown(rowByText('Search Sessions'))
     fireEvent.change(screen.getByRole('combobox'), { target: { value: 'quarterly' } })
-    const failure = await screen.findByText('Search failed')
-    const row = failure.closest('[role="option"]') as HTMLElement
-    expect(row).toBeTruthy()
+    const failure = await screen.findByRole('alert')
+    // Same guidance obligation as the artifacts scope: the rejection alone left a
+    // reader hunting a developer setting, so the notice leads with what to do.
+    expect(failure.textContent).toContain('Search failed. Try again.')
+    expect(failure.textContent).toContain('gateway down')
+    expect(failure.closest('[role="option"]')).toBeNull()
     expect(screen.queryByText('No sessions match')).toBeNull()
-    // And Enter on it is what re-runs the search.
+
+    // Retry remains a distinct option, and activating it re-runs the search.
+    const row = screen.getByRole('option', { name: 'Retry' })
     const before = sessionSearch.mock.calls.length
     fireEvent.mouseDown(row)
     await waitFor(() => expect(sessionSearch.mock.calls.length).toBeGreaterThan(before))

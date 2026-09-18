@@ -29,6 +29,12 @@ import type { Result, ResourceProvider } from '../types'
  * strings). Title matches additionally bias the client-side ordering; non-title
  * (body-only) matches are kept with a neutral score so backend hits are never
  * dropped.
+ *
+ * WHICH fields the server matches is the caller's call, not this module's: the
+ * request is built in the injected `fetchArtifacts`, so the row mapping below is
+ * shared while the query is not. {@link useArtifactsProvider} is the palette tab's
+ * content search; the Command Bar builds the same provider around a name-only
+ * request.
  */
 
 const PROVIDER_ID = 'artifacts'
