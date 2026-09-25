@@ -101,10 +101,10 @@ def _deny_non_owner_skill_operation(request: web.Request, operation: str) -> web
     """Restrict owner-only skill state to the configured dashboard owner.
 
     Covers the project-skill consent endpoints and every mutating skill
-    handler: CRUD writes, pending approve/dismiss/dismiss-all, pin, and
-    inject-on-trigger. Skill content is injected into agent context, so any
-    skill mutation is an instruction-injection surface: only the dashboard
-    owner may perform it.
+    handler: CRUD writes, pending approve/dismiss/dismiss-all, pin,
+    inject-on-trigger, and the registry install in ``discover.py``. Skill
+    content is injected into agent context, so any skill mutation is an
+    instruction-injection surface: only the dashboard owner may perform it.
     ``is_owner_dashboard_request`` already refuses app tokens (any non-empty
     app identity) and non-owner dashboard subjects, and both outcomes are
     SEL-audited here.
@@ -3379,6 +3379,12 @@ async def api_skills_create(request: web.Request) -> web.Response:
     if not safe_name:
         return web.json_response(
             {"error": "invalid skill name", "code": "invalid_name"}, status=400
+        )
+    # Sanitizing imposes no length bound, so bound it here — on the WHOLE name,
+    # since nesting (``a/b/c``) blows PATH_MAX or mkdir's recursion on short segments.
+    if len(safe_name.encode("utf-8")) > MAX_PROMPT_NAME_BYTES:
+        return web.json_response(
+            {"error": "skill name is too long", "code": "name_too_long"}, status=400
         )
     # Refuse creating into the open-standard read-only territories. Checked on
     # the SANITISED name because that is what create_skill would write (e.g.

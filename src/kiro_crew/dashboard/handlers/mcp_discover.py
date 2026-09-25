@@ -25,6 +25,7 @@ from kiro_crew.dashboard.handlers.mcp import (
     _offload_config_write,
     _set_kirocrew_entry,
 )
+from kiro_crew.mcp_cleanup import mcp_entry_is_muted
 from kiro_crew.mcp_providers.base import ProviderRegistry, ProviderUnavailableError
 from kiro_crew.mcp_providers.capability import CapabilityProvider
 from kiro_crew.mcp_providers.official import OfficialRegistryProvider
@@ -281,6 +282,15 @@ async def api_mcp_discover_install(request: web.Request) -> web.Response:
     write it into the KiroCrew scope enabled=true (reusing the mcp.py write
     helpers). provider=capability: delegate to the edition manager.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "mcp_discover_install")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -363,8 +373,9 @@ async def _install_from_official(request: web.Request, server_id: str) -> web.Re
             # Identical spec already present — a reinstall is a pure no-op:
             # the user's env values AND enabled/disabled state survive.
             # (Re-enabling here would reopen the one-click path around the
-            # configure-then-enable consent step.)
-            enable_now = not existing.get("disabled", False)
+            # configure-then-enable consent step.) Reported through the launch
+            # predicate, so a non-boolean ``disabled`` reads as off here too.
+            enable_now = not mcp_entry_is_muted(existing)
 
     # Rebuild the rendered agent configs so the new server loads on the next
     # session, mirroring api_mcp_apply. Best-effort: the config write above

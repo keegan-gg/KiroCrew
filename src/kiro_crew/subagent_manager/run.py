@@ -73,6 +73,7 @@ if TYPE_CHECKING:
         fire_tool_hooks,
         hook_gate_kwargs,
         identity_grant_covers_child,
+        is_runtime_death,
         logger,
         name_grant,
         provider_fallback_active,
@@ -490,7 +491,56 @@ class RunEventCoordinator(ManagerComponent):
                     self._manager._write_tombstone(info, "cancelled")
             logger.info("Subagent %s cancelled", info.id)
         except Exception as exc:
-            if not info.reaped:
+            if info._reap_started and is_runtime_death(exc):
+                # The ECHO of our own teardown, not a fault of the run.
+                # ``_force_reap`` resets the run's session (or shuts its shared
+                # handle) BEFORE it cancels this task, so the in-flight stream
+                # observes the runtime it lives on being killed and raises
+                # ``AcpProcessDied`` -- "killed (provider shutdown)" -- first.
+                # Recording that text as the run's error made every user stop,
+                # every parent end and every deadline reap read as a runtime
+                # death in the tombstone and an ERROR in the gateway log; four
+                # field reports chased it to the provider and the OOM killer.
+                # Only the runtime death is the echo: any OTHER exception under
+                # a reap is a fault of the run that the teardown merely
+                # interrupted, and keeps the traceback below.
+                # The record instead names the stop: a user/parent stop stays
+                # neutral (``error`` unset, ``outcome == "stopped"``), a
+                # deadline reap is a failure that names the deadline, and the
+                # tombstone carries the reap's own cause. Setting ``done`` here
+                # is what wins the first-arrival record over the reaper's own
+                # synthesis (guard 1 in ``_force_reap``), so the whole record --
+                # error, stat, tombstone -- is written HERE, as it was before.
+                origin = info._stop_origin or "the reaper"
+                if not info.done:
+                    # Neutrality follows the FIRST stopper. A Stop that lands
+                    # while a deadline reap already owns the teardown sets
+                    # ``user_stopped`` too; the record still belongs to the
+                    # deadline, so the flag is put back and the failure kept.
+                    neutral = info.stop_is_neutral
+                    if not neutral:
+                        info.user_stopped = False
+                        if not info.error:
+                            info.error = (
+                                f"{origin} — the runtime was torn down before the run finished"
+                            )
+                    if not info.result and info.streaming_text:
+                        info.result = info.streaming_text
+                    info.done = True
+                    if not neutral:
+                        Stats().inc_subagent_failed()
+                    self._manager._write_tombstone(info, info._reap_reason or "reaped")
+                # One attributable line, at the level the action deserves: a
+                # user's own stop is routine; a parent end or a deadline reap
+                # discarded live work the user did not ask to lose.
+                log = logger.info if info._reap_reason == "user_stop" else logger.warning
+                log(
+                    "Subagent %s stopped mid-turn by %s (the stream reported: %s)",
+                    info.id,
+                    origin,
+                    _describe_exception(exc),
+                )
+            else:
                 # Story appended INSIDE the cap: info.error reaches a WS frame
                 # and the Subagents panel, so the rendered total stays bounded
                 # by _MAX_ERROR_DETAIL_LEN exactly as before — and the budget
@@ -502,7 +552,7 @@ class RunEventCoordinator(ManagerComponent):
                 info.done = True
                 Stats().inc_subagent_failed()
                 self._manager._write_tombstone(info, "error")
-            logger.exception("Subagent %s failed", info.id)
+                logger.exception("Subagent %s failed", info.id)
         finally:
             # Guard 3 of 3 — the terminal REPORT, owned by the finalize claim.
             # Taken (and the report task SPAWNED) before the teardown awaits
@@ -710,7 +760,13 @@ class RunEventCoordinator(ManagerComponent):
             or any(a.parent_session_key == parent_session_key for a in self._manager.running)
         )
 
-    def _emit_queue_depth_impl(self, parent_session_key: str, batch_id: str = "") -> None:
+    def _emit_queue_depth_impl(
+        self,
+        parent_session_key: str,
+        batch_id: str = "",
+        *,
+        wait: dict[str, Any] | None = None,
+    ) -> None:
         """Emit the current queued depth for *parent_session_key* as a
         ``subagent_queued`` lifecycle event.
 
@@ -720,9 +776,22 @@ class RunEventCoordinator(ManagerComponent):
         This advisory count lets the UI show "N waiting to start" the moment a
         wave is accepted, and stay mounted across the staggered ramp.
 
+        *wait* is the gate's label for WHY the rows wait (``reason`` one of the
+        ``QUEUED_REASON_*`` kinds, plus ``available_gb`` / ``required_gb`` for the
+        memory kinds). The gate passes it on the emit that follows its verdict;
+        it is remembered per parent and rides on every later emit for that
+        parent -- the drain's and the cancel path's re-emits carry no verdict of
+        their own -- until the parent's depth reaches 0, when it is forgotten
+        and the event is once again the bare ``{"queued": 0}``. Absent on an
+        event exactly when nothing was labelled, so a client reading only the
+        count is unaffected and one reading the reason never sees a stale one.
+
         Fire-and-forget: scheduled on the running loop; a no-op in sync/test
         contexts without a loop (the count is advisory UI signal, not state).
         """
+        manager = self._manager
+        if wait is not None:
+            manager._queue_wait[parent_session_key] = dict(wait)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -733,18 +802,25 @@ class RunEventCoordinator(ManagerComponent):
             parent_session_key=parent_session_key,
             batch_id=batch_id,
         )
-        admission = self._manager._admission
+
+        def _extra(depth: int) -> dict[str, Any]:
+            if depth <= 0:
+                manager._queue_wait.pop(parent_session_key, None)
+                return {"queued": depth}
+            return {"queued": depth, **manager._queue_wait.get(parent_session_key, {})}
+
+        admission = manager._admission
         store = admission.taskq_store()
         if store is None or not type(admission).pump_off_loop:
-            depth = self._manager._queued_depth(parent_session_key)
-            loop.create_task(self._manager._fire_event("subagent_queued", info, {"queued": depth}))
+            depth = manager._queued_depth(parent_session_key)
+            loop.create_task(manager._fire_event("subagent_queued", info, _extra(depth)))
             return
         # The store half of the count (rows outside the window) runs on the
         # writer thread; the window half and the emit stay on the loop.
         from kiro_crew.taskq import KIND_SUBAGENT
 
         in_window = sum(
-            1 for q in self._manager._queue if q.get("parent_session_key", "") == parent_session_key
+            1 for q in manager._queue if q.get("parent_session_key", "") == parent_session_key
         )
         exclude_ids = admission.taskq_excluded_ids()
         live_store = store
@@ -759,9 +835,7 @@ class RunEventCoordinator(ManagerComponent):
                 )
             except Exception:
                 overflow = 0
-            await self._manager._fire_event(
-                "subagent_queued", info, {"queued": in_window + int(overflow)}
-            )
+            await manager._fire_event("subagent_queued", info, _extra(in_window + int(overflow)))
 
         loop.create_task(_emit())
 

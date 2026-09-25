@@ -33,7 +33,7 @@ from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY, hook_gate_kwargs
 from kiro_crew.llm_helpers import save_conversation_turn_off_loop
 from kiro_crew.memory_stores import UnknownMemoryStore
-from kiro_crew.messaging import auto_title
+from kiro_crew.messaging import auto_title, turn_ceiling
 from kiro_crew.messaging.dispatch import (
     admit_inbound_callback,
     build_directive_consumer,
@@ -45,6 +45,7 @@ from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import SLACK_NAMESPACE, canonical_key
+from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.platform import current_context
 from kiro_crew.security import redact, redact_local_paths
 from kiro_crew.sel import sel
@@ -66,7 +67,10 @@ from kiro_crew.slack.handler import (
     maybe_route_linked_thread,
     track_background_task,
 )
-from kiro_crew.slack.renderer import PARTIAL_TURN_MARKER, SlackApprovalDecider, SlackRenderer
+from kiro_crew.slack.renderer import PARTIAL_TURN_MARKER
+from kiro_crew.slack.renderer import SlackApprovalDecider
+from kiro_crew.slack.renderer import SlackApprovalDecider as _APPROVAL_REGISTRY
+from kiro_crew.slack.renderer import SlackRenderer
 from kiro_crew.stats import Stats
 
 if TYPE_CHECKING:
@@ -769,7 +773,7 @@ async def handle_message_transport(
             ),
             audit_session_key=session_key,
             audit_agent=_agent or "kirocrew",
-            closing_gate=lambda: sessions.begin_turn(session_key),
+            closing_gate=turn_ceiling.gate(session_key, lambda: sessions.begin_turn(session_key)),
         )
         # The thread's owner as of the moment the turn starts producing output.
         # A dashboard link landing during the run moves the conversation to a
@@ -1026,6 +1030,17 @@ async def handle_message_transport(
                 exc_info=True,
             )
 
+    except TurnCeilingExceeded as exc:
+        # At the conversation's turn ceiling, so no turn opened. Unlike the
+        # shutdown branch below this is NOT spooled -- the spool replays a message
+        # our restart dropped, and this one was refused on purpose -- and it is
+        # not charged to the circuit breaker. The notice goes into the thread,
+        # because a refusal the user cannot see is the silence this guard exists
+        # to remove.
+        logger.warning("Slack turn ceiling reached for %s -- conversation paused", session_key)
+        await turn_ceiling.render_refusal(renderer, exc)
+        with contextlib.suppress(Exception):
+            await slack.set_thread_status(channel, reply_ts, "")
     except SessionClosingError:
         # Shutdown began between the claim and the dispatch, so no turn opened.
         # Mirrors the native handler's own gate: clear the thread status and
@@ -1194,6 +1209,19 @@ async def handle_message_transport(
         except Exception:
             pass
     finally:
+        # An approval window the driver never awaited -- the blocks went out and
+        # the turn then ended before the decider -- has no wait of its own to close
+        # it, so a later click would resolve a future nobody reads while the user
+        # is told their decision was applied.
+        #
+        # ``_APPROVAL_REGISTRY`` is ``SlackApprovalDecider`` under a second name.
+        # Reservations are class state, so the sweep has to reach the class holding
+        # them, and the construction name above is a seam callers and tests
+        # substitute to observe the decider a turn builds. Sweeping through that
+        # name aims at the substitute: it raises on a plain function, and on a
+        # stand-in class it clears an empty registry and leaves the real window
+        # armed past the end of its turn.
+        _APPROVAL_REGISTRY.discard_session(session_key)
         # A turn that consumed the post-compaction flag but never landed
         # discarded the prompt carrying the re-injected context; put the flag
         # back so the next turn re-injects it.

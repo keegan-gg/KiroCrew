@@ -28,10 +28,11 @@ open state sends conversation text to a third party.
 
 Two budgets, both named here so a caller can size its own outer wait: the provider
 call is bounded by :func:`timeout_secs`, and the row write by
-:data:`_LOG_BUDGET_SECS` on top of it. Nothing this module logs carries a provider
-message or a traceback -- a row's ``error`` is one of the identifiers below and the
-application log gets the exception CLASS only, because both artifacts are readable
-and a provider can quote the request back.
+:data:`_LOG_BUDGET_SECS` plus, only after an overrun, the bounded
+:data:`_LOG_COMMIT_GRACE_SECS`. Nothing this module logs carries a provider message
+or a traceback -- a row's ``error`` is one of the identifiers below and the application
+log gets the exception CLASS only, because both artifacts are readable and a provider
+can quote the request back.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ import asyncio
 import logging
 import math
 import re
+import threading
 import time
 from hashlib import sha256
 from typing import Any
@@ -125,6 +127,17 @@ POINTS_NEEDING_COMPACTION = frozenset({"compaction.keep"})
 #: inert here.
 POINTS_NEEDING_MEMORY_TEXT = frozenset({"memory.recall"})
 
+#: Points whose request carries EVIDENCE GATHERED FROM OTHER SESSIONS AND THIRD
+#: PARTIES -- a watched worker's transcript tail, a bot's review comment body, a
+#: work-ledger event -- and which therefore need the keystone's ``nudge_evidence``
+#: scope (``consent.consented_nudge_evidence``). A FOURTH set rather than a wider
+#: reading of ``compaction``, because the two were reviewed as different things:
+#: that scope is the OWNING session's own transcript, text the owner was present
+#: for, while this is text from conversations the owner was not in and from a
+#: forge they do not control. An install that granted any other scope is inert
+#: here, which is the property every scope on this keystone exists to give.
+POINTS_NEEDING_NUDGE_EVIDENCE = frozenset({"nudge.wake"})
+
 #: The model id sent when the config leaves ``provider.model`` empty -- the same
 #: fallback ``impl_jev`` applies, so the id the scrub clears is the id sent.
 _DEFAULT_MODEL = DECISION_PROVIDER_MODEL_DEFAULT
@@ -136,14 +149,16 @@ _BUCKET_MOD = 100
 _DEFAULT_TIMEOUT_MS = 1000.0
 _MIN_TIMEOUT_SECS = 0.001
 
-#: How long the row write may hold the caller, on top of the provider budget. The
-#: write is one ``O_APPEND`` of a few hundred bytes, so this exists only so a
-#: stalled filesystem cannot make an observation cost the turn. On expiry the
-#: awaiting side gives up and ``decide`` returns; the worker thread is NOT
-#: cancellable, so the append may still land afterwards -- acceptable for a write
-#: that cannot corrupt a line. An outer wait therefore needs ``timeout_secs()``
-#: plus this.
+#: How long the row write may hold the caller before the receipt gets a short grace
+#: period to observe a definitive commit or refusal. The write is one ``O_APPEND`` of
+#: a few hundred bytes, so the first bound exists only so a stalled filesystem cannot
+#: make an observation cost the turn.
 _LOG_BUDGET_SECS = 0.05
+
+#: Extra time for an append that crossed the write budget to publish its commit signal
+#: or finish with a refusal. If neither happens, the receipt remains unknown rather
+#: than reporting a false refusal while the worker may still commit.
+_LOG_COMMIT_GRACE_SECS = 0.10
 
 #: A row's ``error`` is one of these -- an identifier an operator can act on, never
 #: a provider message, which is unbounded and can quote the request back.
@@ -340,6 +355,7 @@ POINT_SCOPE_KEYS: dict[str, str] = {
     **{p: _consent.STATE_KEY_TOOL_ARGS for p in POINTS_NEEDING_TOOL_ARGS},
     **{p: _consent.STATE_KEY_COMPACTION for p in POINTS_NEEDING_COMPACTION},
     **{p: _consent.STATE_KEY_MEMORY_TEXT for p in POINTS_NEEDING_MEMORY_TEXT},
+    **{p: _consent.STATE_KEY_NUDGE_EVIDENCE for p in POINTS_NEEDING_NUDGE_EVIDENCE},
 }
 
 
@@ -357,6 +373,10 @@ _POINT_SCOPES: dict[str, tuple[str, str]] = {
     **{
         p: ("consented_memory_text", "the text of recalled memories")
         for p in POINTS_NEEDING_MEMORY_TEXT
+    },
+    **{
+        p: ("consented_nudge_evidence", "evidence from other sessions and third parties")
+        for p in POINTS_NEEDING_NUDGE_EVIDENCE
     },
 }
 
@@ -614,6 +634,35 @@ def _judge_authority(
         return LANE_JEV, False
 
 
+def judge_evidence_scope_granted(
+    *, session_key: str | None = None, config: Any | None = None
+) -> bool:
+    """Whether the owner granted :data:`JUDGE_POINT`'s OWN egress scope. Never raises.
+
+    Narrower than :func:`is_enabled` on this point, and deliberately so. ``is_enabled``
+    answers "could any lane serve a tick", which the LLM lane satisfies on the provider
+    key alone -- correct for a loop whose owner armed a brief, because
+    :func:`_judge_authority` documents that spec as half of that lane's authorization.
+    Screening a loop whose owner armed NOTHING has no such half, so it asks the
+    narrower question instead: did this owner grant this point's own egress category.
+
+    Composed from the same two primitives :func:`_judge_authority` uses -- the
+    endpoint consent read and :func:`_point_scope_granted` -- rather than a second
+    rule of its own. Fail-closed: anything unreadable answers False, which leaves the
+    tick firing exactly as an ungated timer would.
+    """
+    try:
+        cfg = config if config is not None else _snapshot()
+        if cfg is None:
+            return False
+        if not _consented_for(cfg, session_key, JUDGE_POINT):
+            return False
+        return _point_scope_granted(JUDGE_POINT, _consent.load_state())
+    except Exception as exc:
+        logger.debug("decisions: judge scope unreadable (%s)", type(exc).__name__)
+        return False
+
+
 def history_budget_chars(config: Any | None = None) -> int:
     """Characters of prior conversation this decision may carry. Never raises.
 
@@ -809,6 +858,7 @@ async def decide(
     session_key: str | None = None,
     config: Any | None = None,
     extra: dict[str, Any] | None = None,
+    receipt: dict[str, Any] | None = None,
 ) -> Answers | None:
     """Ask *questions* about *state* at *point*, or return ``None``.
 
@@ -831,7 +881,19 @@ async def decide(
     naming a core row field is dropped by the log. A refusal that writes no row
     (no consent, unknown point, unsampled) writes no extra either, which is the
     same claim as before: those three touch no disk.
+
+    *receipt* reports whether this attempted decision is on record. When supplied, it
+    starts with ``row_written=False`` on paths that never start an append. Once an
+    append starts, the value resolves to true after append-line commitment or false
+    after a definitive refusal, even when the post-append retention sweep outlives the
+    write budget. If neither outcome arrives within the bounded grace, it remains
+    ``None`` rather than claiming a refusal while the append is still running. A caller
+    that supplies no receipt returns when the write budget expires and pays no grace.
+    This additive signal does not change ``None`` as the only failure return.
     """
+    if receipt is not None:
+        receipt["row_written"] = False
+
     # Guarded because *config* may be an arbitrary object whose attribute reads
     # raise, and this seam must never alter the turn it sits in.
     try:
@@ -873,6 +935,7 @@ async def decide(
         # WRITE, this protects BUILDING the row, which renders values an
         # implementation supplied. The class only, never a message, for the same
         # reason.
+        row_written: bool | None = False
         try:
             row = _log.build_row(
                 point=point,
@@ -883,9 +946,43 @@ async def decide(
                 error=error,
                 extra=extra,
             )
-            await asyncio.wait_for(asyncio.to_thread(_log.append, row), _LOG_BUDGET_SECS)
+            # A caller that asked for no receipt observes nothing about commitment, so
+            # it gets the bare call this seam has always made: no event to set, no
+            # keyword to accept, and no grace to pay. The receipt path is the only one
+            # that needs a commit signal, so it is the only one that creates it.
+            commit_event = threading.Event() if receipt is not None else None
+            row_written = None
+            append_task = asyncio.create_task(
+                asyncio.to_thread(_log.append, row)
+                if commit_event is None
+                else asyncio.to_thread(_log.append, row, commit_event=commit_event)
+            )
+            try:
+                row_written = await asyncio.wait_for(asyncio.shield(append_task), _LOG_BUDGET_SECS)
+            except asyncio.TimeoutError:
+                if commit_event is None:
+                    # Nothing reads a receipt here, so the write budget is the end of
+                    # what this call waits for.
+                    return
+                commit_wait = asyncio.create_task(
+                    asyncio.to_thread(commit_event.wait, _LOG_COMMIT_GRACE_SECS)
+                )
+                await asyncio.wait(
+                    (append_task, commit_wait),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if commit_event.is_set():
+                    row_written = True
+                elif append_task.done():
+                    row_written = append_task.result() is True
+                if not commit_wait.done():
+                    commit_wait.cancel()
         except Exception as exc:
+            row_written = False
             logger.warning("decisions: could not record %s row (%s)", point, type(exc).__name__)
+        finally:
+            if receipt is not None:
+                receipt["row_written"] = row_written
 
     # The model id the SELECTED lane will name, so the scanned id IS the sent id.
     # For every lane but the judge's LLM one this is ``provider.model`` with the

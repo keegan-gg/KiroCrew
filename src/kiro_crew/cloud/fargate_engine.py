@@ -473,17 +473,18 @@ class FargateSigninHandle:
     """The sign-in step, which for Fargate has nothing to wait for.
 
     The evidence is in the image rather than in an argument: ``runtime/Dockerfile:130``
-    states the credential is "Supplied at run time, never baked in",
-    ``supervisor/__main__.py:422`` calls ``require_api_key(env)`` before serving, and a
-    search of the whole runtime subtree for device-code, SSO, OAuth or interactive-login
-    strings returns zero hits. The container is handed a key and refuses to boot without
-    one; nobody ever signs it in.
+    states the credential is "Supplied at run time, never baked in", the supervisor
+    writes the delivered identity into the crew's vault and calls
+    ``require_model_identity`` before serving, and a search of the whole runtime
+    subtree for device-code, SSO, OAuth or interactive-login strings returns zero
+    hits. The container is handed an identity and refuses to boot without one; nobody
+    ever signs it in.
 
     So this handle completes immediately rather than polling. It reports success
-    because the credential's PRESENCE was already enforced at container start --
-    and only presence. ``require_api_key``'s own docstring is explicit that a
-    present key is not a working one and that validity "can only be established by
-    a real turn", so this handle must not be read as evidence the credential works.
+    because the identity's PRESENCE was already enforced at container start --
+    and only presence. ``require_model_identity``'s own docstring is explicit that a
+    usable identity is not a working one and that validity "can only be established
+    by a real turn", so this handle must not be read as evidence the credential works.
 
     ``run_launch`` reads ``error`` first and ``already_logged_in`` next, and with an
     empty ``error`` it takes the already-signed-in branch: that branch marks the step
@@ -1051,6 +1052,14 @@ class FargateLaunchEngine:
             secrets=spec.secrets,
             cpu_architecture=spec.cpu_architecture,
             log=default_log_spec(region),
+            # Stated, not omitted, because ``store`` carries no default: a task this
+            # engine launches keeps its data home on its own disk, so its sessions end
+            # when it stops. There is nowhere for an operator to write a file system
+            # id yet -- ``FargateLaunchSpec`` has no field for one and ``cloud.json``
+            # has no key -- and inventing one is the same class of error as inventing a
+            # subnet. Naming the answer here is what makes it reviewable, and what
+            # makes the lane that adds the id a change to one visible line.
+            store=None,
         )
 
     def preflight(self, profile: str, region: str) -> None:
@@ -1169,6 +1178,10 @@ class FargateLaunchEngine:
             size=size,
             launch_tag=tag,
             started_by=started_by,
+            # The same bound the sweep above enforces, carried into the task so it
+            # still holds where the sweep cannot reach: a cluster whose last launch
+            # has already happened is never swept again.
+            ttl_seconds=self._bounds.ttl_seconds,
         )
         result = aws.checked_json(
             ["ecs", "run-task", "--cli-input-json", _json(request)],

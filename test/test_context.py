@@ -9,6 +9,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from conftest import plant_day_link
 from kiro_crew.context import ContextBuilder, _neutralize_structural_markers
 from kiro_crew.hooks import ContextRule, HookManager, HooksConfig
 from kiro_crew.learn import LessonStore
@@ -426,6 +427,40 @@ class TestContextBuilder:
         assert msg.index("[THEME PERSONA]") < msg.index(marker)
         assert msg.index(marker) < msg.index(header) < msg.index(request)
 
+    def test_request_prefix_without_trailing_newline_does_not_swallow_the_next_block(
+        self, tmp_path
+    ):
+        """A ``$skill`` body arrives ``.strip()``ed (no trailing newline). The
+        assembly must still open the next block on its own line, or the context
+        breakdown books that block's bytes to the skill."""
+        from kiro_crew.context_blocks import split_blocks
+
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        request = "hi"
+        generated = "\n\n[Skill: demo]\n\nloaded procedure with no newline at the end"
+        span: list[int] = []
+        msg, _ = builder.build_message(
+            request,
+            is_new_session=False,
+            interactive=True,
+            session_key="dashboard:chat-1",
+            project="/workspace/example",
+            request_prefix_context=generated,
+            user_text_range=(0, len(request)),
+            user_span_out=span,
+        )
+        assert "\n[REPLY FORMAT RULES]" in msg
+        out = split_blocks(msg, user_span=(span[0], span[1]))
+        assert "reply_format_rules" in out
+        assert out["loaded_skill"] == len(
+            "[Skill: demo]\n\nloaded procedure with no newline at the end\n"
+        )
+        assert sum(out.values()) == len(msg)
+
     def test_dashboard_tool_nudges_require_interactive(self, tmp_path):
         """A non-interactive turn (e.g. automation) gets neither the OPTIONS
         reminder nor either dashboard-card tool nudge."""
@@ -491,11 +526,178 @@ class TestContextBuilder:
             s["name"] == "widget-maker" for s in builder.skills.search_skills("widget-maker")
         )
 
+    def test_reinjection_restores_agent_contract_after_compaction(self, tmp_path):
+        """The managed spec prompt only points at this block, so compaction must restore it."""
+        from kiro_crew.agent import _NATIVE_PROMPT_STUB
+
+        builder = self._reinject_builder(tmp_path)
+        fresh, _ = builder.build_message("first turn", is_new_session=True)
+        msg, _ = builder.build_message("carry on", is_new_session=False, needs_reinjection=True)
+
+        def contract(m: str) -> str:
+            start = m.index("[AGENT SYSTEM PROMPT]\n") + len("[AGENT SYSTEM PROMPT]\n")
+            return m[start : m.index("\n[END AGENT SYSTEM PROMPT]", start)]
+
+        assert msg.count("[AGENT SYSTEM PROMPT]\n") == 1
+        reinjected = contract(msg)
+        assert reinjected.strip()
+        assert "follow it as your authoritative contract" not in reinjected
+        assert _NATIVE_PROMPT_STUB not in reinjected
+        assert reinjected == contract(fresh)
+
+    @staticmethod
+    def _contract(m: str) -> str:
+        """The text inside the ``[AGENT SYSTEM PROMPT]`` block."""
+        start = m.index("[AGENT SYSTEM PROMPT]\n") + len("[AGENT SYSTEM PROMPT]\n")
+        return m[start : m.index("\n[END AGENT SYSTEM PROMPT]", start)]
+
+    def test_the_restored_contract_carries_the_session_start_cap(self, tmp_path):
+        """The delegation cap in the contract is a live host reading, so a
+        reading that moves between two assemblies would make the restored
+        contract differ from the one the session was given. The figure is a
+        per-session snapshot, and re-injection reuses it."""
+        builder = self._reinject_builder(tmp_path)
+        with patch(
+            "kiro_crew.resource_status.adaptive_exec_cap",
+            side_effect=[4242, 4343, 4444],
+        ):
+            fresh, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+            msg, _ = builder.build_message(
+                "carry on",
+                is_new_session=False,
+                needs_reinjection=True,
+                session_key="dashboard:chat-cap-a",
+            )
+        # Equality alone is also satisfied by a rendering that dropped the
+        # token, so the substitution is asserted on its own.
+        assert "{{MAX_SUBAGENTS}}" not in self._contract(fresh)
+        assert "4242" in self._contract(fresh)
+        assert self._contract(msg) == self._contract(fresh)
+
+    def test_each_session_start_takes_its_own_cap_reading(self, tmp_path):
+        """The snapshot is per session, not per process: a session starting
+        reads the cap in force for it, so the figure still tracks the host."""
+        builder = self._reinject_builder(tmp_path)
+        with patch(
+            "kiro_crew.resource_status.adaptive_exec_cap",
+            side_effect=[4242, 4343, 4444],
+        ):
+            first, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+            second, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+        assert "4242" in self._contract(first)
+        assert "4343" in self._contract(second)
+
+    def test_another_session_start_leaves_this_contract_alone(self, tmp_path):
+        """One builder assembles every session in the gateway, so a sibling
+        session starting between the two assemblies must not change what
+        compaction restores here."""
+        builder = self._reinject_builder(tmp_path)
+        with patch(
+            "kiro_crew.resource_status.adaptive_exec_cap",
+            side_effect=[4242, 4343, 4444],
+        ):
+            fresh, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+            builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-b"
+            )
+            msg, _ = builder.build_message(
+                "carry on",
+                is_new_session=False,
+                needs_reinjection=True,
+                session_key="dashboard:chat-cap-a",
+            )
+        assert "4242" in self._contract(fresh)
+        assert self._contract(msg) == self._contract(fresh)
+
+    def test_an_eviction_during_the_reading_cannot_break_the_caller(self, tmp_path):
+        """One builder serves every session, so a sibling thread's eviction can
+        land on this key in the gap after this call stores it. Eviction takes the
+        oldest entry and the restoring render of the oldest session is the caller
+        that would read it back, so the figure is handed over as a local rather
+        than fetched from the memo a second time."""
+
+        class EvictsRightAfterStoring(dict):
+            """The memo as the losing interleaving leaves it: the entry is gone
+            the instant after it is stored, which is where a sibling thread's
+            eviction lands."""
+
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                super().pop(key, None)
+
+        builder = self._reinject_builder(tmp_path)
+        builder._cap_figures = EvictsRightAfterStoring()
+
+        with patch.object(builder, "_live_cap_figure", return_value="7171"):
+            figure = builder._session_cap_figure("dashboard:chat-evicted", refresh=True)
+
+        assert figure == "7171"
+        assert ContextBuilder._cap_memo_key("dashboard:chat-evicted") not in builder._cap_figures
+
+    def test_an_oversized_session_key_is_not_what_the_memo_retains(self, tmp_path):
+        """The cap counts entries, and counting bounds memory only if each entry
+        is bounded. A session key arrives from the caller at any length and an
+        entry leaves only by eviction, so the key is digested before it is kept."""
+        builder = self._reinject_builder(tmp_path)
+        huge = "dashboard:" + "k" * 100_000
+
+        with patch.object(builder, "_live_cap_figure", return_value="5151"):
+            assert builder._session_cap_figure(huge, refresh=True) == "5151"
+            # The same session still finds its own reading.
+            assert builder._session_cap_figure(huge, refresh=False) == "5151"
+
+        assert huge not in builder._cap_figures
+        assert [len(k) for k in builder._cap_figures] == [64]
+
+    def test_the_cap_memo_transaction_is_serialized(self, tmp_path):
+        """The reading, the eviction and the insertion are one transaction: a
+        second thread must not observe the memo between them."""
+        builder = self._reinject_builder(tmp_path)
+        held: list[bool] = []
+
+        def observe_lock() -> str:
+            held.append(builder._cap_figures_lock.locked())
+            return "3131"
+
+        with patch.object(builder, "_live_cap_figure", side_effect=observe_lock):
+            builder._session_cap_figure("dashboard:chat-locked", refresh=True)
+
+        assert held == [True]
+        assert not builder._cap_figures_lock.locked()
+
+    def test_a_rendering_session_stops_being_the_next_one_evicted(self, tmp_path):
+        """Evicting the oldest ENTRY picks the longest-lived session, which is
+        the one most likely to still be restored -- so the reading this exists to
+        preserve would be the first dropped. A hit moves its key to the end, and
+        eviction takes the least recently used instead."""
+        builder = self._reinject_builder(tmp_path)
+        with (
+            patch.object(ContextBuilder, "_CAP_FIGURE_SESSIONS", 3),
+            patch.object(builder, "_live_cap_figure", side_effect=["1", "2", "3", "4"]),
+        ):
+            for key in ("dashboard:s-a", "dashboard:s-b", "dashboard:s-c"):
+                builder._session_cap_figure(key, refresh=True)
+            # s-a restores its contract, so it is the most recently used.
+            assert builder._session_cap_figure("dashboard:s-a", refresh=False) == "1"
+            builder._session_cap_figure("dashboard:s-d", refresh=True)
+
+        assert ContextBuilder._cap_memo_key("dashboard:s-a") in builder._cap_figures
+        assert ContextBuilder._cap_memo_key("dashboard:s-b") not in builder._cap_figures
+
     def test_no_reinjection_when_the_flag_is_absent(self, tmp_path):
         """The default path is unchanged — no marker, no index re-injection."""
         builder = self._reinject_builder(tmp_path)
         msg, _ = builder.build_message("carry on", is_new_session=False)
         assert "[REINJECTED AFTER COMPACTION" not in msg
+        assert "[AGENT SYSTEM PROMPT]\n" not in msg
 
     def test_no_reinjection_on_a_new_session(self, tmp_path):
         """A new session already gets the index from the session context;
@@ -1075,6 +1277,78 @@ class TestLoadAgentPrompt:
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
         assert ContextBuilder._load_agent_prompt("test") == ""
 
+    @staticmethod
+    def _write_spec(tmp_path, monkeypatch, prompt: str) -> None:
+        import json
+
+        agents_dir = tmp_path / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        (agents_dir / "test.json").write_text(
+            json.dumps({"name": "test", "prompt": prompt}), encoding="utf-8"
+        )
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir)
+        monkeypatch.setattr("kiro_crew.agent_discovery._KIRO_AGENTS_DIR", agents_dir)
+
+    @staticmethod
+    def _managed_contract(tmp_path, monkeypatch):
+        from kiro_crew import agent
+
+        package = tmp_path / "installed-package" / "config"
+        package.mkdir(parents=True)
+        contract = package / "prompt.md"
+        contract.write_text("RESOLVED_CONTRACT", encoding="utf-8")
+        monkeypatch.setattr(agent, "_BUNDLED_CFG_DIR", package)
+        monkeypatch.setattr(agent, "_project_dir", lambda: None)
+        assert agent._prompt_path() == contract
+        return contract
+
+    @pytest.mark.parametrize("owner_template", ["", "test"], ids=["fork-or-copy", "owner"])
+    def test_managed_stub_resolves_to_contract(self, tmp_path, monkeypatch, owner_template):
+        """The stub is the managed contract whatever spec carries it: a fork or
+        template copy inherits it verbatim and must not receive the stub TEXT as
+        its persona."""
+        from kiro_crew import agent
+
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, agent._NATIVE_PROMPT_STUB)
+        loaded = ContextBuilder._load_agent_prompt("test", owner_template=owner_template)
+        assert loaded == "RESOLVED_CONTRACT"
+
+    @pytest.mark.parametrize("owner_template", ["", "test"], ids=["fork-or-copy", "owner"])
+    def test_managed_pointer_resolves_to_contract(self, tmp_path, monkeypatch, owner_template):
+        contract = self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, f"file://{contract}")
+        loaded = ContextBuilder._load_agent_prompt("test", owner_template=owner_template)
+        assert loaded == "RESOLVED_CONTRACT"
+
+    def test_owner_template_custom_prompt_omitted(self, tmp_path, monkeypatch):
+        """An owner template's own (non-managed) prompt reaches the model through
+        member essentials, so the session-start load omits it."""
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, "You are a bespoke reviewer.")
+        assert ContextBuilder._load_agent_prompt("test", owner_template="test") == ""
+        assert ContextBuilder._load_agent_prompt("test") == "You are a bespoke reviewer."
+
+    def test_template_copy_with_stub_delivers_contract_once_at_session_start(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: a plain (non-member) session on a template copy of the
+        managed default, whose spec inherited the stub verbatim, gets the resolved
+        contract as its [AGENT SYSTEM PROMPT] exactly once, and never the stub text."""
+        from kiro_crew import agent
+
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, agent._NATIVE_PROMPT_STUB)
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        msg, _ = builder.build_message("hello", is_new_session=True, agent="test")
+        assert msg.count("RESOLVED_CONTRACT") == 1
+        assert "[AGENT SYSTEM PROMPT]\nRESOLVED_CONTRACT\n[END AGENT SYSTEM PROMPT]" in msg
+        assert "follow it as your authoritative contract" not in msg
+
 
 class TestRuntimeDisplayName:
     """Tests for _runtime_display_name() and agent identity injection."""
@@ -1461,6 +1735,7 @@ class TestBuildMessageOffloadedAtCallSites:
         fake_memory.vector_store = vector_store
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         vector_store.get_lessons.return_value = []
 
         with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
@@ -1477,6 +1752,7 @@ class TestBuildMessageOffloadedAtCallSites:
         fake_memory.vector_store = vector_store
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         vector_store.get_lessons.return_value = []
         vector_store.get_semantic_context.return_value = ""
 
@@ -1554,7 +1830,8 @@ class TestAsyncCallSitesUseToThread:
 
 
 class TestMemoryGetContextQueryWiring:
-    """Startup passes the request but disables activity; explicit readers retain it."""
+    """Startup reads preferences protected (activity off) and the activity block
+    as budgeted background; explicit readers retain the combined read."""
 
     def _builder(self, tmp_path):
         return ContextBuilder(
@@ -1570,6 +1847,7 @@ class TestMemoryGetContextQueryWiring:
         fake_memory = MagicMock()
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         fake_memory.vector_store = None
 
         with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
@@ -1592,8 +1870,8 @@ class TestMemoryGetContextQueryWiring:
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
@@ -1613,8 +1891,8 @@ class TestMemoryGetContextQueryWiring:
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: False,
         )
@@ -1658,13 +1936,16 @@ class TestMemoryGetContextQueryWiring:
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
         msg, _ = builder.build_message("q", True, "s1")
-        assert "[EPISODIC-SENTINEL]" not in msg
+        # The protected preferences read (include_activity=False) never builds
+        # episodes; the budgeted activity block does, exactly once.
+        assert msg.count("[EPISODIC-SENTINEL]") == 1
+        assert "[EPISODIC-SENTINEL]" not in store.get_context(query="q", include_activity=False)
         assert store.get_context(query="q").count("[EPISODIC-SENTINEL]") == 1
 
     def test_episodic_query_is_the_user_message(self, tmp_path):
@@ -1680,15 +1961,157 @@ class TestMemoryGetContextQueryWiring:
 
         store._vector_store = SimpleNamespace(
             get_episodic_context=_episodic,
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
         builder.build_message("find my tokyo notes", True, "s2")
-        assert seen == []
-        store.get_context(query="find my tokyo notes")
         assert seen == ["find my tokyo notes"]
+        store.get_context(query="find my tokyo notes")
+        assert seen == ["find my tokyo notes", "find my tokyo notes"]
+
+    def test_activity_block_is_background_not_protected(self, tmp_path):
+        # A long history must be droppable by the admission loop, so it enters
+        # the discretionary pool and never the protected set.
+        from types import SimpleNamespace
+
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store._vector_store = SimpleNamespace(
+            get_episodic_context=lambda query_text, cap: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            has_any_lesson=lambda: True,
+        )
+        huge = "ACTIVITY-FILLER " * 10_000
+        with patch.object(type(store), "get_activity_context", return_value=huge):
+            msg, _ = builder.build_message("q", True, "s3")
+        assert "ACTIVITY-FILLER" not in msg
+        assert "omitted background context" in msg
+
+
+class TestUnreadableActivityAtSessionStart:
+    """An unreadable notebook file must not abort the session-start build.
+
+    ``build_session_context`` reads ``activity_index`` BEFORE the tolerant
+    activity sections, so a projects file that raises ``OSError`` (a directory
+    in its place, a permission denial) has to be skipped there too; a raise at
+    that call loses the protected preferences with it. A single unreadable
+    history day is skipped by the per-day read itself, and a history failure
+    that is not tied to one day file is skipped by the whole-window guard.
+    """
+
+    # The sentinels below ride in background blocks the admission loop may drop
+    # under host memory pressure, so the host's free memory is pinned off.
+    pytestmark = pytest.mark.usefixtures("ample_host_resources")
+
+    def _builder(self, tmp_path):
+        return ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+
+    def test_history_day_replaced_by_a_directory_keeps_preferences(self, tmp_path):
+        from datetime import date, timedelta
+
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        store.write_projects("PROJECT_SENTINEL")
+        store.append_history("VALID_HISTORY_SENTINEL")
+        unreadable_day = (date.today() - timedelta(days=1)).isoformat()
+        (store._history_dir / f"{unreadable_day}.md").mkdir()
+
+        ctx = builder.build_session_context()
+
+        assert "PREF_SENTINEL" in ctx
+        assert "PROJECT_SENTINEL" in ctx
+        # The per-day read skips only the poisoned day; the valid day rides.
+        assert "## Recent History" in ctx
+        assert "VALID_HISTORY_SENTINEL" in ctx
+
+    def test_history_day_link_keeps_preferences_without_target(self, tmp_path):
+        """Session startup skips a linked history day without exposing its target."""
+        from datetime import date, timedelta
+
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.txt"
+        secret.write_text("SECRET_SENTINEL", encoding="utf-8")
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        plant_day_link(store._history_dir / f"{yesterday}.md", secret)
+        store.append_history("VALID_HISTORY_SENTINEL")
+
+        ctx = builder.build_session_context()
+
+        assert "SECRET_SENTINEL" not in ctx
+        assert "PREF_SENTINEL" in ctx
+        assert "VALID_HISTORY_SENTINEL" in ctx
+
+    def test_history_window_unreadable_keeps_preferences(self, tmp_path, monkeypatch):
+        """A history failure not tied to one day file skips only history."""
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        store.write_projects("PROJECT_SENTINEL")
+        store.append_history("VALID_HISTORY_SENTINEL")
+
+        def _unreadable(*args, **kwargs):
+            raise PermissionError("history directory is unreadable")
+
+        monkeypatch.setattr(store, "_read_recent_history_uncached", _unreadable)
+
+        ctx = builder.build_session_context()
+
+        assert "PREF_SENTINEL" in ctx
+        assert "PROJECT_SENTINEL" in ctx
+        assert "## Recent History" not in ctx
+        assert "VALID_HISTORY_SENTINEL" not in ctx
+
+    def test_projects_file_replaced_by_a_directory_keeps_preferences(self, tmp_path):
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        store.append_history("HISTORY_SENTINEL")
+        store._projects_file.unlink()
+        store._projects_file.mkdir()
+
+        ctx = builder.build_session_context()
+
+        assert "PREF_SENTINEL" in ctx
+        assert "HISTORY_SENTINEL" in ctx
+        assert "## Active Projects" not in ctx
+
+    def test_projects_file_link_keeps_preferences_without_target(self, tmp_path):
+        """Session startup omits a linked ``projects.md`` without exposing its target."""
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        store.append_history("HISTORY_SENTINEL")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.txt"
+        secret.write_text("SECRET_SENTINEL", encoding="utf-8")
+        store._projects_file.unlink()
+        plant_day_link(store._projects_file, secret)
+
+        ctx = builder.build_session_context()
+
+        assert "SECRET_SENTINEL" not in ctx
+        assert "PREF_SENTINEL" in ctx
+        assert "HISTORY_SENTINEL" in ctx
+        assert "## Active Projects" not in ctx
 
 
 class TestDurableModelVersionLessonContext:
@@ -1728,8 +2151,8 @@ class TestDurableModelVersionLessonContext:
         memory = builder.get_memory_for(None)
         memory._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: False,
         )
@@ -1863,3 +2286,10 @@ class TestKeepVisibleMarkerRule:
 
         assert "<!-- keep-visible -->" in _CRITICAL_RULES
         assert "<!-- keep-visible -->" not in _CRITICAL_RULES_CHANNEL
+
+    def test_prefers_restructuring_over_marker(self):
+        from kiro_crew.context import _CRITICAL_RULES, _CRITICAL_RULES_CHANNEL
+
+        clause = "Prefer restructuring the turn so the deliverable IS its last message"
+        assert clause in _CRITICAL_RULES
+        assert clause not in _CRITICAL_RULES_CHANNEL

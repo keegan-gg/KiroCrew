@@ -41,7 +41,7 @@ from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.messaging.link import telemetry_channel_of
-from kiro_crew.platform_compat import proc_child_map
+from kiro_crew.platform_compat import proc_child_map, process_matches
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session import BACKGROUND_KEY
 from kiro_crew.subagent import _CLK_TCK, _subtree_cpu_jiffies
@@ -64,15 +64,6 @@ _HISTORY_LEN = 60
 # servers is this session carrying" signal. Imported rather than spelled out so
 # it cannot drift from the launch line the rewriter emits.
 _STUB_MARKER = STUB_MODULE
-
-
-def _read_cmdline(pid: int) -> str:
-    """Return ``/proc/<pid>/cmdline`` as a string, or "" when unreadable."""
-    try:
-        with open(f"/proc/{pid}/cmdline", encoding="utf-8", errors="replace") as fh:
-            return fh.read().replace("\0", " ")
-    except OSError:
-        return ""
 
 
 def _spend_for_session(
@@ -156,13 +147,23 @@ def lineage_parents(
     recover from: neither view says which is right.
 
     The join is by SLOT, never by pid or title, and a row is reachable under
-    three spellings of its slot because three writers spell it differently. A
-    crew log names a slot the way ``session_create`` attributed it -- the bare
-    ``slot.key`` for a dashboard session -- while the row's key is the full
-    ``dashboard:`` session key. A slot bound to a channel or cron conversation
-    runs its turns under ``linked_session_key`` while its log still carries the
-    dashboard slot key, so *spend_slot_by_session* (the alias
-    :func:`_spend_for_session` already bridges for credits) is the third.
+    every spelling its own writers use, because they do not agree on one. A
+    crew log names a slot the way ``session_create`` attributed it -- the key the
+    creating caller authenticated as -- while the row's key is whatever its own
+    payload is keyed by: the full ``dashboard:`` session key on the Sessions
+    table, the bare ``slot.key`` on the slots payload. A slot bound to a channel
+    or cron conversation runs its turns under ``linked_session_key``, so its
+    session key and its slot key are unrelated strings and only one of them is in
+    any given payload.
+
+    *spend_slot_by_session* is that correspondence -- session key to slot key,
+    the alias :func:`_spend_for_session` already bridges for credits -- and it is
+    read in BOTH directions here, which is what lets one call serve both
+    payloads. A Sessions-table row keyed by session finds its slot spelling
+    through the map; a slots row keyed by slot finds its session spelling through
+    the same map inverted. Each caller therefore passes the SAME map and gets the
+    same edges, where a one-directional read left a channel-born conductor
+    nesting its workers on one surface and orphaning them on the other.
 
     *nodes* is the projection's fold, and each caller passes the one it reads: the
     memory payload takes :meth:`SessionMemorySampler._lineage` (whose companion flag
@@ -180,12 +181,28 @@ def lineage_parents(
         return {}
     from kiro_crew.crew_log.session_tree import parent_payload
 
+    # Session key -> slot key as given, and slot key -> session key inverted. Built
+    # once per call rather than per row: the map is the whole live registry, and the
+    # inverse is read for every row.
+    #
+    # Last writer wins in the inverse, matching the forward map's own documented rule
+    # for two slots claiming one session identity. A slot has exactly one effective
+    # session key, so the collision this can produce is the same one the forward map
+    # already carries rather than a new one.
+    forward: dict[str, str] = {}
+    inverse: dict[str, str] = {}
+    if isinstance(spend_slot_by_session, dict):
+        for session_key, slot_key in spend_slot_by_session.items():
+            if isinstance(session_key, str) and isinstance(slot_key, str):
+                if session_key and slot_key:
+                    forward[session_key] = slot_key
+                    inverse[slot_key] = session_key
+
     def slot_spellings(row_key: str) -> list[str]:
         spellings = [row_key, _bare_slot_key(row_key)]
-        if isinstance(spend_slot_by_session, dict):
-            aliased = spend_slot_by_session.get(row_key)
-            if isinstance(aliased, str) and aliased:
-                spellings.append(aliased)
+        for extra in (forward.get(row_key), inverse.get(row_key)):
+            if isinstance(extra, str) and extra:
+                spellings.append(extra)
         return spellings
 
     live_key_of: dict[str, str] = {}
@@ -356,6 +373,24 @@ class SessionMemorySampler:
         its meaning. What changes is that they now describe one set of processes
         observed once, which is what the shared walker's own docstring says a
         single frontier is for.
+
+        A command line is matched through ``platform_compat.process_matches``,
+        which is the helper the cross-platform table names for that question, so
+        the stub count asks it the one way this repository asks it.
+
+        **Every figure here is UNCAPPED, and that is the ruling, not an
+        oversight.** The shared walker bounds its own frontier at
+        ``platform_compat._SUBTREE_MAX_PROCS``; that ceiling guards a looping or
+        pathological ``/proc`` graph, which this walk is already immune to for a
+        different reason -- it visits each pid at most once. Adopting the number
+        here would therefore bound the FIGURE rather than the work, and a bounded
+        figure is the worse of the two failures: a truncated count reaches the
+        card as a plain integer no consumer can tell from a complete one, so the
+        surface presents it as exact, while ``None`` is this payload's way of
+        saying UNMEASURABLE. A count that is slow is recoverable; a count that is
+        wrong and looks authoritative is not. Should the walk's cost ever need a
+        bound, the bound that keeps that meaning intact is a work or time budget
+        that yields ``None`` on exhaustion -- never a ceiling that truncates.
         """
         procs: Optional[int] = None
         stubs: Optional[int] = None
@@ -363,7 +398,7 @@ class SessionMemorySampler:
             tree = _iter_descendant_pids(pid, children=children)
             rss_mb = _get_rss_tree_mb(pid, pids=tree)
             procs = len(tree)
-            stubs = sum(1 for p in tree if _STUB_MARKER in _read_cmdline(p))
+            stubs = sum(1 for p in tree if process_matches(p, (_STUB_MARKER,)))
             cpu = self._cpu_cores(pid, now, pids=tree)
         else:
             # No descendant set to reuse: the other platforms reach the total

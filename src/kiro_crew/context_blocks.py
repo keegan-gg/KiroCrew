@@ -48,6 +48,7 @@ _MARKERS: Final[tuple[tuple[str, str], ...]] = (
     ("context_scope", r"\[CONTEXT SCOPE\]"),
     ("recovery", r"\[(?:SESSION RESUMED|REINJECTED AFTER COMPACTION)"),
     ("semantic_memory", r"\[Semantic Memory"),
+    ("task_facts", r"\[Task facts"),
     ("skill_index", r"\[Skills:\]"),
     ("lessons", r"\[Learned corrections"),
     ("episodic_memory", r"\[Episodic Memory"),
@@ -74,7 +75,35 @@ _MARKERS: Final[tuple[tuple[str, str], ...]] = (
     ("request_header", r"\[CURRENT USER REQUEST"),
 )
 
-_COMPILED: Final = tuple((label, re.compile(pat)) for label, pat in _MARKERS)
+# Every opener above is emitted by the assembly at the START of a line: each
+# block ends its own text with a newline before the next one is appended. The
+# same bracketed phrases also appear MID-LINE as prose — the agent prompt
+# (``config/prompt.md``) explains ``[RESOURCES]``, ``[Hook context:]``,
+# ``[INCOGNITO SESSION]`` and nine more to the model, in backticks — and an
+# unanchored scan took each mention for a real block start. Measured on one
+# real session: the 38,236-char agent prompt was reported as 438, and its
+# remaining 37.8K was booked to ``resource_advisory`` (12,348), ``hook_context``
+# (10,374), ``surface``, ``working_folder`` and two session modes that were
+# not even on. Anchoring to line start is what makes "the assembly emitted
+# this marker" and "the marker matched" the same statement.
+#
+# ``request_header`` is the one exception: the interactive-guidance paragraphs
+# before it end with ``)`` and no newline, so the header legitimately follows
+# them on the same line. The hyphenated form the assembly emits is scrubbed out
+# of every untrusted source before assembly; a bare ``[CURRENT USER REQUEST]``
+# is not, and can still count as a header hit here. That is a pre-existing
+# breakdown-only concern (the span the panel trusts comes from the assembly,
+# not from this scan), not a boundary-forgery one.
+#
+# The one seam whose text the assembly does not shape itself -- the caller's
+# ``request_prefix_context`` (a ``$skill`` body arrives ``.strip()``ed) -- is
+# newline-terminated by the assembly for exactly this reason.
+_LINE_START_EXEMPT: Final[frozenset[str]] = frozenset({"request_header"})
+
+_COMPILED: Final = tuple(
+    (label, re.compile(pat if label in _LINE_START_EXEMPT else r"^" + pat, re.MULTILINE))
+    for label, pat in _MARKERS
+)
 
 # Closing markers, by label. A block that has one owns only up to its OWN
 # closer; the characters between that closer and the next opening marker belong
@@ -106,12 +135,17 @@ _CLOSERS: Final[dict[str, re.Pattern[str]]] = {
         ("session_wrapper", r"\[END OF SESSION CONTEXT\]"),
         ("workspace_identity", r"\[End of workspace identity\]"),
         ("docs_pointer", r"\[END DOCUMENTATION\]"),
-        ("memory", r"\[End of memory(?: activity index)?\]"),
+        # Three memory blocks share this opener: the protected `[Memory —` read,
+        # the `[Memory activity index —` hints and the budgeted `[Memory activity
+        # —` block. Each closes with its own spelling, so one alternation covers
+        # them; a closer left out here lets that block absorb what follows it.
+        ("memory", r"\[End of memory(?: activity(?: index)?)?\]"),
         ("memory_tools", r"\[End of memory tools\]"),
         ("steering", r"\[End of steering resources\]"),
         ("thread_history", r"\[End of thread history\]"),
         ("recovery", r"\[END REINJECTED\]"),
         ("semantic_memory", r"\[End of semantic memory\]"),
+        ("task_facts", r"\[End of task facts\]"),
         ("skill_index", r"\[End of skills\]"),
         ("lessons", r"\[End of learned corrections\]"),
         ("episodic_memory", r"\[End of episodic memory\]"),
@@ -364,6 +398,31 @@ def split_blocks(
     return {label: size for label, size in out.items() if size > 0}
 
 
+def _block_domain(label: str) -> str:
+    """Group one assembled block by what the provider is being asked to do with it.
+
+    Five domains: the user's own turn is a ``request``, the two instruction
+    blocks are a ``contract``, the three replayed-turn blocks are ``replay``,
+    and the reply-format rules are a ``following_interaction``. Everything else
+    is ``background`` — that is most of ``_MARKERS``, plus the
+    ``UNCLASSIFIED_LABEL`` remainder ``split_blocks`` emits for bytes it could
+    not attribute, so a growing ``background`` share says nothing on its own
+    about which block grew.
+
+    The four named cases are mutually exclusive, so the check order is for
+    reading only and carries no precedence.
+    """
+    if label == USER_LABEL:
+        return "request"
+    if label in {"agent_instructions", "critical_rules"}:
+        return "contract"
+    if label in {"conversation_replay", "thread_history", "history_prefix"}:
+        return "replay"
+    if label == REPLY_FORMAT_LABEL:
+        return "following_interaction"
+    return "background"
+
+
 def measure_prompt(prompt: str, *, user_span: tuple[int, int], lifecycle: str) -> dict:
     """Exact Crew-assembled extents, not provider input or token estimates.
 
@@ -382,23 +441,7 @@ def measure_prompt(prompt: str, *, user_span: tuple[int, int], lifecycle: str) -
             label: {
                 "chars": count,
                 "bytes": byte_counts[label],
-                "domain": (
-                    "request"
-                    if label == USER_LABEL
-                    else (
-                        "contract"
-                        if label in {"agent_instructions", "critical_rules"}
-                        else (
-                            "replay"
-                            if label in {"conversation_replay", "thread_history", "history_prefix"}
-                            else (
-                                "following_interaction"
-                                if label == REPLY_FORMAT_LABEL
-                                else "background"
-                            )
-                        )
-                    )
-                ),
+                "domain": _block_domain(label),
             }
             for label, count in chars.items()
         },

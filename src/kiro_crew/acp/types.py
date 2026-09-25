@@ -32,6 +32,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
+    ACP_BACKENDS_HOOKS_LIST,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_INTERNAL_SANDBOX,
@@ -42,6 +43,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_MEMBER_DISPATCH,
+    ACP_BACKENDS_MEMBER_PANEL,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_POD_HOME_REMAP,
@@ -161,6 +163,18 @@ METHOD_AGENT_SWITCHED = "_kiro.dev/agent/switched"
 METHOD_MCP_OAUTH_REQUEST = "_kiro.dev/mcp/oauth_request"
 METHOD_MCP_SERVER_INITIALIZED = "_kiro.dev/mcp/server_initialized"
 METHOD_MCP_SERVER_INIT_FAILURE = "_kiro.dev/mcp/server_init_failure"
+#: Appended to a session-start timeout's MCP progress when EVERY server the
+#: session put on the wire has reported READY -- a roster member that reported
+#: an init failure is named in the ``failed:`` bucket instead, and then the
+#: stall may well be in it. The count before it covers only the session-injected
+#: roster -- on kiro-cli the broker stubs Kiro Crew injects -- not the agent
+#: spec's own servers and not the backend's session-start steps after MCP init;
+#: without this note a complete count read as "MCP is up, so MCP is the
+#: problem". The fraction already says every server reported, so the note adds
+#: only the conclusion. One string for both start paths
+#: (``AcpRuntime._mcp_init_progress`` and ``AcpClient._mcp_timeout_progress``)
+#: so their messages cannot drift.
+MCP_ROSTER_COMPLETE_NOTE = "the stall is later in session startup, not in those servers"
 METHOD_KAS_MCP_STATUS = "_kiro/mcp/status"
 METHOD_KAS_TOOLS_CHANGED = "_kiro/tools/didChange"
 METHOD_SUBAGENT_LIST_UPDATE = "_kiro.dev/subagent/list_update"
@@ -285,9 +299,14 @@ PROVIDER_LABEL_BY_BACKEND: dict = {
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
 # level of clientCapabilities; every other capability it honours lives under
 # _meta.kiro. The ones there are CALLBACK capabilities — KAS calls back into the
-# client to service them — and Kiro Crew implements none, so leaving them
-# undeclared (= false) is correct rather than a gap. Only the settings channel
-# is opened, because that is how a client selects KAS feature flags.
+# client to service them. Only the settings channel is opened, because that is
+# how a client selects KAS feature flags.
+#
+# ``hooks`` stays undeclared although ``acp/kas_wire.py`` serves all three of its
+# methods. Kiro Crew's own turn loop already fires every hook event this surface
+# can serve for a KAS session, and its PreToolUse can BLOCK a tool on exit 2;
+# announcing would run each hook twice and hand the agent a path whose output is
+# only a context note. Every other callback stays undeclared (= false) too.
 KAS_CLIENT_CAPABILITIES: dict = {
     **ACP_CLIENT_CAPABILITIES,
     "_meta": {"kiro": {"settings": {}}},
@@ -696,10 +715,29 @@ def _command_from_tool_params(params: dict) -> str | None:
             parts.append(f"--region {region}")
         parameters = params.get("parameters")
         if isinstance(parameters, dict) and parameters:
-            try:
-                parts.append(json.dumps(parameters, sort_keys=True))
-            except (TypeError, ValueError):
-                parts.append(str(parameters))
+            # The backend chooses this shape, so the encoder can be pushed past
+            # its recursion ceiling, and ``RecursionError`` is a
+            # ``RuntimeError``: unguarded it escapes into the hook gate and the
+            # skill-read note, which read this property while the turn runs, and
+            # kills the turn. The helper carries the unencodable-value arm
+            # verbatim: a value whose repr still holds the real bytes stays
+            # scannable. Imported here rather than at module scope because
+            # ``_dispatch`` imports THIS module.
+            from kiro_crew.acp._dispatch import (
+                UNSERIALISABLE_SIBLING_VALUE,
+                _dumps_degraded,
+            )
+
+            rendered = _dumps_degraded(parameters, sort_keys=True)
+            # A refusal leaves a placeholder where the payload was, and the
+            # parameters tail is the only place a smuggled command
+            # (``ssm send-command`` and its ``commands``) appears. Returning the
+            # command without it would hand the security checks a string that
+            # reads as complete, so fail closed instead: no command means the
+            # caller's deny-by-default arm refuses the call.
+            if rendered == UNSERIALISABLE_SIBLING_VALUE:
+                return None
+            parts.append(rendered)
         positional = params.get("positional_args")
         if isinstance(positional, list) and positional:
             parts.append(" ".join(str(p) for p in positional))

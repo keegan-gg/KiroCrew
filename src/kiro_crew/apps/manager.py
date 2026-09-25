@@ -1151,11 +1151,16 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
             error_code="trust_grant_not_removed",
         )
 
+    from kiro_crew.apps.backend import _pinned_ancestors  # deferred: see below
+
     quarantined: list[tuple[Path, Path]] = []
     _data_pin = None
     _deps_lock: contextlib.ExitStack | None = None
     try:
         if keep_data:
+            # ONE string for the pin below and every path-based step after it,
+            # or verify() guards a path the renames and deletes do not use.
+            dest = _pinned_ancestors(dest)
             data = dest / "data"
             # Move data to temp, remove app dir, move data back
             tmp_data = dest.parent / f".{name}-data-tmp"
@@ -3471,6 +3476,14 @@ def register_builtin_apps() -> int:
 # ---------------------------------------------------------------------------
 
 _orphaned_builtins_cache: set[str] | None = None
+
+
+def shipped_builtin_names() -> set[str]:
+    """The three sources ``register_builtin_apps`` registers from, screened by the
+    same ``_validate_builtin_app`` it skips on. Wider sets belong to their callers.
+    """
+    candidates = list(_BUILTIN_APPS) + discover_builtin_apps() + _edition_builtin_apps()
+    return {app["name"] for app in candidates if not _validate_builtin_app(app)}
 
 
 def detect_orphaned_builtins(*, force_refresh: bool = False) -> set[str]:

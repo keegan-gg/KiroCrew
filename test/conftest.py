@@ -239,6 +239,28 @@ def make_dir_link(link: pathlib.Path, target: pathlib.Path) -> None:
     link.symlink_to(target, target_is_directory=True)
 
 
+def plant_day_link(link: pathlib.Path, secret_file: pathlib.Path) -> None:
+    """Plant a reparse point at the dated history name ``link`` that leads outside.
+
+    The property under test is that a memory reader never publishes bytes that
+    live outside the memory tree when the agent-writable dated ``.md`` name is a
+    reparse point. On POSIX the planted shape is a FILE symlink to
+    ``secret_file``, the exact credential-exfiltration vector. On Windows a file
+    symlink needs SeCreateSymbolicLinkPrivilege, so the stand-in is a directory
+    JUNCTION at ``link`` pointing at ``secret_file.parent``: a junction needs no
+    privilege, is a reparse point at the same dated name, and the guarded reader
+    refuses it through ``is_link_or_junction`` and its non-regular check, so the
+    outside directory's contents can never be read as a day. Both variants keep
+    the assertion running on every CI platform instead of skipping it.
+    """
+    if platform_compat.IS_WINDOWS:
+        import _winapi
+
+        _winapi.CreateJunction(str(secret_file.parent), str(link))
+        return
+    link.symlink_to(secret_file)
+
+
 def host_abs(*parts: str) -> str:
     """A fixture path that is absolute on THIS host: ``/opt/shims`` or ``C:\\opt\\shims``.
 
@@ -805,6 +827,33 @@ def _reset_degraded_config_observations():
     reset_degraded_observations()
     yield
     reset_degraded_observations()
+
+
+@pytest.fixture(autouse=True)
+def _reset_channel_turn_ceiling():
+    """Forget the channel turn ceiling's process-global per-conversation counts.
+
+    ``kiro_crew.messaging.turn_ceiling`` keeps ONE counter for the whole process
+    (``_SHARED``), keyed by session key, so a counted turn outlives the test that
+    drove it. Tests share one interpreter and the Slack, Telegram and Discord
+    inbound routes all drive the same handful of session keys, so a worker that
+    runs more gated channel turns under one key than the ceiling allows latches
+    that conversation for the rest of the worker: every LATER test on the same key
+    gets a refused turn instead of the behaviour it asserts, in files that never
+    mention the ceiling. A wide shard reaches the default of 90 and reds
+    ``test_slack_success_after_delivery_10050.py``, whose native-route tests then
+    book neither success nor failure because the handler returns at the gate.
+
+    The notification sink is module-global for the same reason and is cleared with
+    it, so a test that registers an observer cannot be heard by the next one.
+    """
+    from kiro_crew.messaging.turn_ceiling import set_notification_sink, shared_ceiling
+
+    shared_ceiling().clear()
+    set_notification_sink(None)
+    yield
+    shared_ceiling().clear()
+    set_notification_sink(None)
 
 
 @pytest.fixture(autouse=True)

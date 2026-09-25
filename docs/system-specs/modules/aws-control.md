@@ -189,7 +189,14 @@ directories that a rename could swap out from under a transfer; at the top level
 the only ancestors are the data home and `$HOME`, the residual every other
 fenced leaf already stands on. That same mask would hide the directory from the
 sandboxed CLI, so the per-call directory is granted to that one fixed-argv spawn
-through `engine.run_aws(extra_visible_dirs=...)`. The mask is a Linux/macOS
+through `engine.run_aws(extra_visible_dirs=...)`. That grant cancels any mask
+CONTAINING the path it names, so the transfer first asks
+`sandbox.carveout_shadowed_by_foreign_mask` about the staging ROOT: on a data
+home relocated beneath another masked tree (`KIROCREW_HOME` under `~/.gnupg`)
+the grant would hand that whole tree to the CLI child, and the transfer raises
+before the spawn instead — a refused preview, never an unmasked credential
+directory. The root is the entry the grant cancels and is exempt from its own
+check; a default layout is unaffected. The mask is a Linux/macOS
 mechanism; on Windows, which has no sandbox, the destination is pinned by
 identity instead — the whole path, not just the file. The staging root and then
 the per-call directory are each opened and held through
@@ -507,8 +514,9 @@ rather than on a skip. An unchanged night cannot consume a keep slot or prune th
 the next skip depends on.
 
 Both push keys carry a timestamp, so nothing is overwritten and the drive would
-otherwise only grow. `backup._prune_remote_archives` runs as the LAST step of a
-successful push, and by default it retires nothing: retention is OFF unless this
+otherwise only grow. `backup._prune_remote_archives` runs as the last step of a
+successful push unless that run reported a conversation-export gap, and by default it
+retires nothing: retention is OFF unless this
 account's `backup.json` holds a usable count under `RETENTION_KEEP_STATE_KEY`. That
 key is the whole switch. Absent, or holding anything that is not an integer, means
 keep every archive, so a fresh install and an upgraded one both behave exactly as
@@ -848,13 +856,62 @@ account; the default is withhold, and an unreadable or non-boolean stored value
 also withholds. The permission is read once, before the archive is opened, and
 the resulting run record carries `layer_b` so whoever inspects the run can tell
 which layers the archive holds rather than inferring it from an absent key. That
-value is taken from the number of kiro-cli files actually added, not from the
+value is taken from what the archive actually received -- kiro-cli files added, or
+conversation rows carried under `conversations/` -- not from the
 permission: a granted run whose kiro-cli directory is absent or empty adds none,
 and a record is written once, so reading the permission there would state a
-fidelity the object does not hold with nothing afterwards to correct it.
+fidelity the object does not hold with nothing afterwards to correct it. Either
+source alone sets it, because either one alone puts unredacted model context in the
+archive.
 Nothing reads the field programmatically -- `restore_download` does not consult
 it -- so it is a record for a human or an incident review, and the two archives
 it distinguishes are otherwise identical by name.
+
+Under the same permission the archive also gains a `conversations/` root: the kiro-cli
+terminal conversations, exported from that CLI's own SQLite store. This payload's REACH
+differs from the `cli` half's even though its sensitivity class is the same: the `cli`
+half is this product's own session files, while the conversation store records every
+interactive kiro-cli use on the host, including work unrelated to this product's
+sessions. One permission covers both because the gate is priced by the payload's class,
+and the grant's own description names both so an operator does not price the narrower one
+and receive both. The store file itself is never archived, because it holds the account
+tokens beside the conversations. The
+export is table-scoped instead, copying an ALLOWLIST of conversation tables row by row,
+so a credential table added to that store upstream is not carried. The boundary is the
+table set: within an allowlisted table every column the source declares is copied, so
+the allowlist fails closed one level up rather than per column. The store is opened
+read-only through the sanctioned credential-read audit, and the export is dropped if that
+audit cannot be recorded, because the audit is owed for opening a token-bearing file
+rather than for what is taken out of it. Only fixed, home-anchored store locations are
+consulted: a location named by the environment falls outside the agent-file-tool fence,
+where an agent could author the rows this archive then uploads off-host.
+
+`conversations_skipped` carries the reason when that export carried less than the host
+holds, and is absent from the record when there is none. A skip nobody can see is the
+failure the field answers: without it an operator reads a complete-looking record and
+believes they hold conversations the object does not contain. Which exits set it follows
+one rule rather than a list the code has to stay in step with: every exit meaning the
+export tried to reach this host's store and did not carry what it holds sets a reason,
+and only a run that read everything or one the operator declined may leave the field
+empty. That covers a store refused for a redirection or unreadable or absent, a value the
+export could not sanitise or wider than its per-cell ceiling, a scratch file that failed
+validation, and an audit that could not be recorded. None of them fails the run: the crew
+transcripts and the kiro-cli files are still correct, and discarding a good archive over a
+missing member is the worse trade.
+
+Any reason in that field also suppresses the retention sweep for that run, which is the
+condition on `_prune_remote_archives` above. The sweep protects only the key the current
+run uploaded, so at a keep count of one it would retire the previous archive -- and an
+earlier archive may hold conversations this one does not, since none of those states is
+pinned from one run to the next. `delete_object_versions` erases versions outright, so
+the retired object has no recovery while the gap recovers on the next successful run. The
+suppression stops the DELETION and not the audit: a declined sweep still files its
+retention event, with the reason, because this is the one path in the module that erases
+object versions permanently and that function's contract is that every terminal outcome
+files one. That event is also what makes the accepted cost observable -- while such a
+state persists the archives accumulate past the keep count, and one event per run naming
+the reason is how an auditor sees that rather than inferring it from a sweep that
+silently never ran.
 
 The grant is stored PER ACCOUNT as `sessionsIncludeLayerB` in the app's state
 document, `backup.json`, which sits inside the `apps/aws-control/data` directory
@@ -868,6 +925,131 @@ subject can write it is not an authorization. The sole writer is the owner-gated
 directly rather than through the agent file gate. The grant is per account
 because the risk it prices is the destination bucket, so granting it for one
 account must not grant it for another.
+
+The grant also carries a SCOPE marker, `sessionsLayerBScope`, in the same account
+entry. The permission stays one boolean and the operator gains no second control; the
+marker records which payloads the recorded decision covers, because the grant's meaning
+widened when the conversation export was added. A grant carrying `cli+conversations`
+covers both. A grant with no marker, or with any value this code does not recognise,
+covers the `cli` half only -- reading it as covering the conversation store would ship
+host-wide terminal context off-host on a consent that named this product's session
+files, and an object already in a bucket cannot be recalled. `set_sessions_layer_b`
+stamps the marker only when the CALLER NAMES that scope, through an optional `scope`
+field on the same `POST /backup/{account}/layer-b` request. The route keeps its shape
+and its meaning: `enabled` is still the only required field, a bare `{"enabled": true}`
+records the narrower grant, and there is no new endpoint and no new control.
+
+Naming it is required because the act of enabling carries no evidence of what the
+operator was shown. An idempotent retry, an automation, and a client still rendering
+older copy all send the same bare body as a deliberate re-consent. A transition test --
+stamp only when the grant goes from off to on -- closes the retry but not a FIRST enable
+from a stale client, where the operator reads the narrower description and the grant
+covers the whole host. The request is the only place the decision can travel.
+
+An enable whose scope field is ABSENT neither widens nor narrows: the stored marker is
+left exactly as it is, because absence is no statement about scope, and treating it as a
+withdrawal would revoke a real consent on every retry from an older client. An enable
+that NAMES a scope this code does not recognise is a different request and CLEARS the
+marker: the caller said what it wanted and it was not the conversation export, so an
+already-wide grant must not stay wide for it. A disable removes the marker with the
+grant, so a later enable cannot inherit a scope from a decision that was withdrawn. The
+response echoes the resulting scope whenever one was named, so a caller cannot believe it
+consented to the wider payload.
+
+Both directions of a grant write file a SEL event naming what was decided --
+`_audit_layer_b_grant`, carrying the direction and the resulting scope. The route's own
+event records the operation and the path, not which way the decision went, so learning
+what the grant became would mean reading the state file, which is the on-disk dependency
+the decision audit exists to remove. A narrowing is filed on the same footing: a review
+reconstructing what an archive was allowed to carry needs the revocation as much as the
+grant.
+
+The scope is rechecked immediately before the upload, beside the grant itself. The grant
+staying on does not mean it still covers this payload: a disable followed by an enable
+naming no scope leaves the permission on with the marker gone, so the grant recheck
+passes while the conversations already written into that archive are no longer consented
+to. Only the withdrawn direction refuses, matching the grant's own recheck, since a
+scope granted mid-build leaves an archive without the conversations and that is the
+withholding default.
+
+A run whose grant does not reach the export records `layer_b_scope` in the run record
+and NO `conversations_skipped`. That split is deliberate. The skip field suppresses the
+retention sweep, so using it here would freeze retention on every install that granted
+Layer B before the export existed, which is the unbounded accumulation the suppression
+exists to prevent rather than an instance of it. An out-of-scope grant is the operator's
+own decision, so it belongs with the other policy-declined exit: recorded as state.
+
+That leaves a second question the skip field cannot answer, and the sweep answers it
+separately. A narrowed scope produces a run whose archive carries no conversations with
+nothing wrong, so no skip reason is set -- while an EARLIER archive, uploaded when the
+scope did reach them, may be the only copy and would be retired at a keep count of one
+with no recovery. So the account records one persisted fact,
+`sessionsConversationsRetained`, set whenever a run uploads an archive carrying a
+`conversations/` root, and the sweep is declined when this run carries none while that
+fact holds. TWO independent conditions feed one decline: this run's export coming up
+short, and an older retained archive holding what this one does not.
+
+The fact is one boolean read through a predicate rather than a list of archives, for the
+same reason the skip suppression is a predicate: a second list to keep in sync is a place
+to forget one, and the cost of forgetting is a permanent delete. It only ever goes true,
+which is correct rather than lazy -- while it holds the sweep is declined, so the archive
+it refers to is never retired, so the fact stays true. A run that DOES carry
+conversations prunes normally, because the newest archive holds them and retiring older
+ones loses nothing, and that is what lets retention resume. An install that never carried
+them has nothing to protect and prunes exactly as it did before this feature existed.
+
+The fact is carried on the run record as well as on the account, because the account-level
+key does not survive a failed state write: the recovery path holds the run record alone and
+merges back records, uploads and versions. Held only on the account, the fact would vanish
+on a full or read-only filesystem while the archive it protects stayed in the drive, and
+only another conversation-bearing run could set it again -- which a narrowed scope makes
+impossible. It is also set for a run whose record was superseded, since which record wins
+the slot says nothing about what the drive holds, and the recovery merge only ever sets it:
+a record carrying no conversations cannot lower it.
+
+The fact is read through the SAME unpersisted overlay as the sweep's own ownership and
+version sets, and re-read inside the lock hold that already re-reads the keep count. Two
+same-account sessions runs can overlap, because the owner-triggered path does not pass the
+upload gate and so is not serialized against a nightly run in flight. Without the shared
+overlay the two halves of one decision came from different snapshots by construction: the
+other run's key was already a live candidate while the fact protecting it was invisible.
+The in-lock re-read then covers the cross-process ordering, since the sidecar file lock is
+what orders processes, and a refusal there costs a kept archive until the next sweep rather
+than the only copy.
+
+One residue remains and is not closeable by any reader: a run held UNPERSISTED by another
+process has its fact in that process's memory alone, so no lock and no overlay can observe
+it. Closing it would mean ordering the upload, the marker write and the remote delete in one
+cross-process protocol, which rewrites shared retention and locking machinery well beyond
+this change.
+
+The conversation export's scratch file is read through a DESCRIPTOR, not re-derived from
+its name. It is written into a ``TemporaryDirectory`` and then opened relative to a pinned
+directory descriptor with ``O_NOFOLLOW``, and the descriptor is checked for a regular file
+and a link count of one before any byte reaches the archive; the member's size comes from
+that same ``fstat``. Mode 0700 on the directory excludes other users, not the same-UID
+agent this product's threat model assumes, so a private directory is not on its own a
+reason to read by path. A substitution is refused as
+``scratch_export_unsafe``, which carries a reason and so suppresses the retention sweep,
+and it is detected before the first tar write so the archive is never left damaged.
+
+The scratch file is written under the agent-masked app data root, not the system temp
+directory, and that ordering matters: descriptor pinning cannot rescue a shared temp root,
+because a same-UID agent that replaces the temp directory before the open hands over a
+directory of its own in which every pinned check passes on a file it chose. The masked root
+removes the reachability; the pinning is depth behind it. The root is guarded against a link
+planted at it, and the resolve is re-checked after the ``mkdir`` because ``exist_ok`` accepts
+a pre-existing link. On a platform without descriptor-pinned open the export reports
+``scratch_pinning_unavailable`` rather than degrading to a weaker read, which costs nothing
+in practice because the sessions kind is already refused there.
+
+The SEL decision event carries the scope too, not only the permission.
+`_audit_layer_b_decision` records `layer_b` and `conversations` as separate allowed or
+withheld values, because that event exists so a consent question has an answer that does
+not depend on the run record still being on disk. An event naming only the permission
+would describe a run that shipped the terminal conversations identically to one that
+withheld them, and reading the scope back from the run record would put the audit on the
+very dependency it removes.
 
 A revocation landing while an archive is being built refuses the upload:
 `run_sessions_backup` re-reads the permission immediately before the PUT and
@@ -1171,13 +1353,35 @@ corrupt or absent stamp, a stamp in the future from a backwards clock step. That
 the rule `_a_day_since_last_run` already states for an unparseable success stamp,
 and a failure record is a new place for the same silence to appear.
 
-Any success clears the count, atomically inside `_record_run_locked`'s mutate
-rather than as a second write beside it, so no wake can land between the run record
-and the clear. Only the SCHEDULED path records a failure, while a success from
-anywhere clears one: an owner pressing the button is present and has just
+A success by a CURRENT run clears the count, atomically inside `_record_run_locked`'s
+mutate rather than as a second write beside it, so no wake can land between the run
+record and the clear. A run whose own record is refused as stale leaves the count
+standing: the clear shares the run write's condition, because a record this document
+has already superseded is not evidence that a later failure is over. Only the
+SCHEDULED path records a failure, while a success from anywhere clears one: an owner
+pressing the button is present and has just
 demonstrated the fault is gone, which is the line `_unattended_sessions_redaction_gap`
 already draws. The status read serves the record as `nightlyFailures` so an operator
 can see the count and the day it started; no console renderer ships with it.
+
+The status read also serves `rememberedArchives`, a per-kind count of the `uploads`
+keys this install holds under each kind's subpath. It exists because `runs` keeps ONE
+record per kind: a second nightly overwrites the first while both archives stay in the
+drive, so a surface reading only that record reports one archive for a prefix holding
+several and an operator cannot see anything accumulating there. Like `nightlyFailures`
+it is derived from the state document this payload already loads, so it is local and
+free and rides on the unpolled half rather than the opt-in remote listing.
+
+It is a count of RECORDS, not an inventory, and it misses in both directions. It reads
+low because the record map is bounded by `MAX_REMEMBERED_UPLOADS` and covers only this
+install's own pushes. It reads HIGH because of the pruning asymmetry above: retention
+deletes the object and the prune clears only the `upload_versions` entry, so the
+`uploads` key outlives the archive it names -- the same direction as "a held version
+outlives its `uploads` counterpart", read the other way round. Only a listing can say
+what the drive holds, which is why the console line carrying this count is worded as a
+record count and opens the stored-archive disclosure instead of standing in for it. It
+renders only when the count exceeds what the run line already implies, so a row whose
+two lines would agree shows one.
 
 The clear alone is not enough, because the two writers serialize under the sidecar lock
 but each mutate re-reads fresh state. An unconditional failure write can therefore land
@@ -1198,11 +1402,15 @@ one-step skew on the next genuine failure. The row is why the guard ships -- mak
 state readable is half of what this change is for -- and a review lane that priced the
 guard against the withheld-attempt claim was right to reject that claim.
 
-A run record reaches the document by TWO paths, so the clear sits on both. The second is
-`_merge_pending`, which carries a run whose own state write raised and was held in memory;
-before it also cleared, a stale count outlived the success that should have ended it, and
-after a restart withheld one nightly for up to the ceiling on an account that had already
-backed up. It is gated on `_run_is_newer` for the same reason the run write is.
+A run record reaches the document by TWO paths, so the clear sits on both, and on both it
+carries the same condition as the run write beside it. `_record_run_locked` gates it on
+`not superseded`, the same-process comparison; `_merge_pending` gates it on
+`_run_is_newer`, the best-effort recovery comparison that also weighs wall time. The two
+spellings are one question -- whether this record is the current one -- and a record that
+loses it is too stale to write a key and so too stale to retire a count a later failure
+accumulated. `_merge_pending` carries a run whose own state write raised and was held in
+memory; a stale count that outlives the success which should have ended it withholds one
+nightly, after a restart, for up to the ceiling on an account that had already backed up.
 
 `run_witness` is a required keyword with no default, so a call site added later cannot
 opt out of the protocol silently -- which is the shape of the bug it closes. Each hooks
@@ -1607,7 +1815,7 @@ bind a forwarded conversation id to, and a binding written against an absent
 identity would fail open. What it does instead is refuse to serve customer turns at
 all unless the deployment has declared `SMC_SINGLE_PRINCIPAL`, which is the RFC's
 one-owner invariant made explicit and enforced at startup rather than assumed. The
-refusal is at startup for the reason `require_api_key` refuses at startup: a
+refusal is at startup for the reason `require_model_identity` refuses at startup: a
 container that answers its port while mixing two callers' conversations looks
 healthy and is not.
 
@@ -1639,7 +1847,7 @@ each wrong once in a way that produced no error:
   kind added later is dropped rather than relayed.
 - **Readiness proves less than it looks like.** A backend with no model credential
   answers its port and then returns `503 kiro_prerequisite_required` on every turn,
-  so a present `KIRO_API_KEY` is not a working one and only a real turn establishes
+  so a usable stored identity is not a working one and only a real turn establishes
   that it is.
 
 A restored transcript is bounded by SIZE as well as by shape. The bytes come from the
@@ -1682,9 +1890,10 @@ does not have, because that reads as coverage while doing nothing.
 (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` and its peers) and the front's
 `SMC_CONTROL_SECRET` are removed: the backend spawns the model subprocess with this
 environment, that subprocess auto-approves every tool, and a turn could otherwise
-read the task role from its own environment and act as it. `KIRO_API_KEY` cannot be
-removed, because kiro-cli re-injects it into the worker and it is the whole
-model-auth mechanism.
+read the task role from its own environment and act as it. The model credential is
+removed on the same grounds, in both of its shapes: the identity reaches the engine
+from the crew's vault through the host auth callback, so the worker needs none in its
+environment.
 
 **A reinstall replaces the bundle's own files and prunes nothing else.**
 `install_bundle` runs at every boot and the data home may be a persistent volume, so
@@ -1806,34 +2015,55 @@ looking for. The container's own writes into the data home already refuse a link
 the destination (`bundle._write_nofollow`); this is the same guard for a file
 another process writes.
 
-### Sandboxed-only, and why there is no opt-in
+### Sandboxed-only, and why removing the credential does not change that
 
 kiro-cli runs the model subprocess inside an unprivileged user namespace, and
-without one `wrap_argv` fails closed. This container runs SANDBOXED-ONLY: there is
-deliberately no config key or environment variable that opts into unsandboxed
-execution, and the supervisor refuses to start on a host that cannot provide the
-sandbox rather than running the worker exposed.
+without one `wrap_argv` fails closed. This container is sandboxed-only: the
+supervisor refuses to start on a host that cannot provide one, loudly, rather than
+answering its port and failing every turn.
 
-The refusal is positive. The probe returns an available verdict, a denied verdict,
-or an `undetermined: <why>` verdict, and only the first proceeds: undetermined
-refuses and names what could not be determined, and so does any verdict the guard
-does not recognise. Reading "could not determine" as "probably fine" fails open as
-new hosts appear, which is the same defect as reading the environment through a
-denylist.
+The credential is nevertheless kept out of the worker's environment, because that is
+worth doing on every host. `build_backend_env` withholds both shapes. The delivered
+identity arrives in the SUPERVISOR's environment as `KIRO_IDENTITY`, is written into
+the crew's encrypted vault by `seed_model_identity`, and is then popped along with
+`KIRO_API_KEY`, which nothing delivers. `acp_backend` is forced to `kas` for the same
+reason: the harness strips the key from the relay's environment and the relay asks the
+host for a token over `_kiro/auth/getAccessToken`, answered by
+`acp/kas_host_auth.answer_get_access_token` inside the backend process.
 
-Why no opt-in, and why the task boundary is not a substitute for one: the model
-subprocess auto-approves every tool and its environment carries `KIRO_API_KEY`, so
-an unsandboxed worker would run an auto-approved shell, driven by untrusted prompt
-content, with a live credential readable in its own environment. The ECS task
-boundary (one owner, one data home, no public endpoint, reached only by an
-authorised call in the owner's own account) does not close that path, because the
-attacker there is the caller's own prompt content, already inside the boundary.
-Offering an unsandboxed posture safely requires brokering the model credential out
-of the worker's environment, which is tracked separately; until then the worker is
-sandboxed or the container does not start. Unprivileged user namespaces are not
-available on Fargate today
+**That is defence in depth, not a licence to drop the sandbox.** What decides whether
+an auto-approved worker is safe is whether it can REACH a credential, not whether one
+is resident in its own environment, and the vault is a route the container cannot
+close. The backend answers the token request from the vault, so the backend's uid must
+be able to decrypt it, and the worker is a child of the backend under that same uid. A
+uid-1000 process reads and decrypts that vault directly. So
+`sandbox_allow_unsandboxed_exec` stays false, and the startup refusal has no
+credential-shaped escape hatch: a clean environment cannot be traded for it.
+
+`verify_sandbox` therefore does two separate things, and the split matters. It ASSERTS
+that the environment handed to the backend carries no credential, refusing on any
+verdict, because that withholding is an invariant this code maintains rather than a
+property of the host — and a value there means it was removed or defeated. It then
+DECIDES on the host's sandbox verdict alone. Taking the posture decision from the
+environment it was handed would be the builder confirming itself: the code that fills
+that dictionary is the code that empties it, so the check could never fail.
+
+The probe returns an available verdict, a denied verdict, or an `undetermined: <why>`
+verdict, and only the first proceeds. Undetermined refuses and names what could not be
+determined, and so does any verdict the guard does not recognise. Reading "could not
+determine" as "probably fine" fails open as new hosts appear, which is the same defect
+as reading the environment through a denylist.
+
+Consequence for Fargate: unprivileged user namespaces are not available there
 ([aws/containers-roadmap#2102](https://github.com/aws/containers-roadmap/issues/2102)),
-so the supported target is a host that permits them.
+Fargate offers no `privileged` flag and no custom seccomp profile, and
+`linuxParameters` admits only `CAP_SYS_PTRACE` — so no task-definition field can
+supply one. The crew container does not run on Fargate today. Closing the remaining
+route is not something this module can do: it needs a user namespace, a worker under a
+different uid from the BACKEND (the gateway's own spawn path, not this container's), or
+a credential not worth stealing — short-lived and narrowly scoped, issued to the task
+rather than to a process. Tracked in
+[#9355](https://github.com/kirodotdev/KiroCrew/issues/9355).
 
 ### Shutdown
 
@@ -1847,7 +2077,14 @@ anything still alive afterwards is an escaped worker, which the teardown sweeps 
 process group over bounded rounds, because a killed process's children reparent to
 PID 1 and surface in the next round.
 
-The exit code distinguishes the two reasons, because it is the only thing the
-platform reads: a stop signal is the one success case, and any other reason,
-including one this code cannot account for, exits non-zero. Reporting both as 0
-told ECS that a crash loop was a clean shutdown.
+The exit code distinguishes the reasons, because it is the only thing the
+platform reads: a stop signal and a spent task lifetime are the success cases, and
+any other reason, including one this code cannot account for, exits non-zero.
+Reporting all of them as 0 told ECS that a crash loop was a clean shutdown.
+
+The lifetime is a cost bound the launcher derives into `SMC_TASK_TTL_SECONDS`, and
+the supervisor's wait carries the deadline: an unattended task then stops billing
+with no scheduler and no further launch, which is the case the launcher's own sweep
+cannot reach. Zero, and an absent variable, mean unbounded. A stop on that deadline
+is ORDERLY -- the task ran for as long as it was allowed -- so it exits 0 and says
+why in the log, rather than sitting on the console beside a crash.

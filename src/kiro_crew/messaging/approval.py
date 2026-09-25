@@ -52,6 +52,7 @@ from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from kiro_crew.constants import DENY_CAUSE_APPROVAL_TIMEOUT
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.renderer import new_approval_nonce
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -134,6 +135,11 @@ class PendingApproval:
     #: knows which bubble to edit. Awaited from :meth:`wait`, so it must not raise
     #: -- it cannot change the verdict, and a failure to speak is not consent.
     on_timeout: Optional[Callable[[], Awaitable[None]]] = None
+    #: Set by :meth:`wait` when the window closed with no answer. The verdict
+    #: is still :data:`DENY` (the wire answer is the same), but the decider
+    #: that reads this can tell the driver WHY, so the model is told the prompt
+    #: expired rather than that a human refused.
+    expired: bool = False
 
     async def wait(self, timeout_s: float) -> str:
         """The typed verdict, or :data:`DENY` when the window closes.
@@ -144,6 +150,7 @@ class PendingApproval:
         try:
             return await asyncio.wait_for(asyncio.shield(self.future), timeout_s)
         except asyncio.TimeoutError:
+            self.expired = True
             await self._announce_timeout()
             return DENY
         except asyncio.CancelledError:
@@ -181,6 +188,31 @@ class PendingApproval:
 #: to the gateway event loop, like the other per-conversation state in this
 #: package, so no lock is taken.
 _PENDING: dict[str, PendingApproval] = {}
+
+
+def adoptable_reservation(
+    pending: "asyncio.Future[bool] | None", loop: asyncio.AbstractEventLoop
+) -> "asyncio.Future[bool] | None":
+    """*pending* when this loop can still use it as a reservation, else ``None``.
+
+    A channel's approval registry is process-global and outlives any one event
+    loop, so a reservation a closed loop left behind stays reachable by key.
+    Awaiting it raises ``RuntimeError: attached to a different loop``, and its
+    lack of a result is not a decision either -- so from here it is not a
+    reservation at all, and the caller opens a fresh window instead.
+
+    Foreign-loop entries are refused whether or not they carry a result, because
+    a decision belongs to the turn that asked for it: a verdict recorded on a
+    loop that has ended cannot answer a request made after it.
+
+    Lives here rather than in each channel because a reservation's adoption rule
+    is one rule. Three copies of it is how the per-channel registries diverged.
+    """
+    if pending is None:
+        return None
+    if pending.get_loop() is not loop:
+        return None
+    return pending
 
 
 def _registry_key(session_key: str, request_id: str) -> str:
@@ -371,8 +403,11 @@ class TextReplyApprovalDecider:
         self.session_key = session_key
         self._sessions = sessions
         self._timeout_s = timeout_s
+        #: Why the LAST call denied -- see ``messaging.driver.ApprovalDecider``.
+        self.last_deny_cause = ""
 
     async def __call__(self, event: Any) -> bool:
+        self.last_deny_cause = ""
         request_id = str(getattr(event, "request_id", "") or "")
         entry = claim_approval(self.session_key, request_id)
         if entry is None:
@@ -390,6 +425,8 @@ class TextReplyApprovalDecider:
         if verdict == TRUST:
             self._grant_session_trust()
             return True
+        if entry.expired:
+            self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT
         return verdict == APPROVE
 
     def trusted(self) -> bool:
@@ -598,6 +635,19 @@ class PendingApprovals:
         this is awaited (``TurnDriver`` dispatches ``PROMPT_CHOICE`` before
         calling the decider), so this only waits.
         """
+        approved, _cause = await self.decide_with_cause(session_key, event)
+        return approved
+
+    async def decide_with_cause(self, session_key: str, event: Any) -> tuple[bool, str]:
+        """:meth:`decide`, plus WHY a denial happened.
+
+        The cause is ``""`` for a human's answer and
+        :data:`DENY_CAUSE_APPROVAL_TIMEOUT` when the window closed unanswered.
+        Returned rather than stored on this object because one registry serves
+        every session of a channel, so an attribute here would race between
+        concurrent turns; :class:`SessionApprovalDecider` (one per session) is
+        where the driver reads it from.
+        """
         k = self.key(session_key, getattr(event, "request_id", ""))
         # Adopt the renderer's reservation. It opened this window before the prompt
         # was sent, which is the whole point: the answer may ALREADY have arrived
@@ -608,7 +658,7 @@ class PendingApprovals:
         reserved = self._pending.get(k)
         if reserved is not None and reserved.done():
             try:
-                return bool(reserved.result())
+                return bool(reserved.result()), ""
             finally:
                 self._pending.pop(k, None)
                 self._nonces.pop(k, None)
@@ -617,7 +667,7 @@ class PendingApprovals:
             fut = asyncio.get_running_loop().create_future()
             self._pending[k] = fut
         try:
-            return bool(await asyncio.wait_for(fut, APPROVAL_TIMEOUT_S))
+            return bool(await asyncio.wait_for(fut, APPROVAL_TIMEOUT_S)), ""
         except asyncio.TimeoutError:
             logger.info(
                 "%s: approval prompt unanswered after %.0fs; denying",
@@ -625,7 +675,7 @@ class PendingApprovals:
                 APPROVAL_TIMEOUT_S,
             )
             _notify_approval_stalled(session_key)
-            return False
+            return False, DENY_CAUSE_APPROVAL_TIMEOUT
         finally:
             # Retire the address AND its nonce with the decision window, so a late
             # answer can never resolve a LATER prompt that reused this request id
@@ -668,11 +718,16 @@ class SessionApprovalDecider:
     captured here rather than passed per call.
     """
 
-    __slots__ = ("_pending", "_session_key")
+    __slots__ = ("_pending", "_session_key", "last_deny_cause")
 
     def __init__(self, pending: PendingApprovals, *, session_key: str) -> None:
         self._pending = pending
         self._session_key = session_key
+        #: Why the LAST call denied -- see ``messaging.driver.ApprovalDecider``.
+        self.last_deny_cause = ""
 
     async def __call__(self, event: Any) -> bool:
-        return await self._pending.decide(self._session_key, event)
+        self.last_deny_cause = ""
+        approved, cause = await self._pending.decide_with_cause(self._session_key, event)
+        self.last_deny_cause = cause
+        return approved

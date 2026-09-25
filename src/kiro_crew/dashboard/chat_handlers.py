@@ -48,6 +48,7 @@ from kiro_crew.dashboard.chat_delivery import (
     TURN_ACTOR_META_KEY,
     attachment_meta,
     normalize_send_id,
+    queue_entry_view,
     queue_for_next_turn,
     start_queue_persist,
     steer_into_running_turn,
@@ -97,6 +98,8 @@ from kiro_crew.dashboard.chat_title import _maybe_auto_title
 from kiro_crew.dashboard.chat_utils import (
     _MANUAL_CONTINUE_MSG,
     _MANUAL_RESUME_MSG,
+    SESSION_START_FAILED_KIND,
+    SLOT_DETAIL_MAX_LIMIT,
     SYNTHETIC_RECOVERY_KIND,
     _broadcast_expired_oauth_banners,
     _build_stream_chunk,
@@ -984,7 +987,8 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         _hold_sid = normalize_send_id(user_meta.get("sendId")) if user_meta else None
         if _hold_sid:
             _hold_meta["sendId"] = _hold_sid
-        _hold_meta.update(attachment_meta(user_meta))
+        _hold_attachments = attachment_meta(user_meta)
+        _hold_meta.update(_hold_attachments)
         if request_app:
             # Same reason as the busy-slot queue above: this entry is drained
             # later, so only its meta can name the actor.
@@ -1007,15 +1011,16 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         # start from the same place. Same single-flight and same self-limiting
         # skip as the other caller.
         start_queue_persist(state, slot)
-        state.broadcast_ws(
-            "queue_push",
-            {
-                "slot": slot.key,
-                "content": _redacted,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "queue_id": qid,
-            },
-        )
+        _hold_push: dict[str, Any] = {
+            "slot": slot.key,
+            "content": _redacted,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "queue_id": qid,
+        }
+        if _hold_attachments:
+            # Same as the busy-slot frame: the card is a cancel's restore source.
+            _hold_push["meta"] = _hold_attachments
+        state.broadcast_ws("queue_push", _hold_push)
         # Same receipt contract as the busy-slot queue branch: `queue_id` binds
         # the sender's pre-send composer state to this exact entry. An entry the
         # durable bounds refuse is reported in the log by the call above, not on
@@ -2319,7 +2324,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
 
     Query params:
       - ``limit``: max messages to return (optional; if omitted, returns ALL messages from disk).
-        Clamped to 1..500. A value below 1 is rejected rather than clamped up, because
+        Clamped to 1..SLOT_DETAIL_MAX_LIMIT (500). A value below 1 is rejected rather than clamped up, because
         no caller asking for 0 wanted exactly one message.
       - ``before``: return messages before this index (legacy pagination, still supported).
         ``before=0`` is valid and yields an empty page.
@@ -2347,7 +2352,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     # plainly a bad request. The branch below still keys off the RAW values, so
     # routing is unchanged.
     try:
-        limit = min(int(limit_raw or "200"), 500)
+        limit = min(int(limit_raw or "200"), SLOT_DETAIL_MAX_LIMIT)
         before = int(before_raw) if before_raw is not None else None
     except ValueError:
         return web.json_response(
@@ -2613,6 +2618,15 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         #
         # `done` is already excluded upstream (`_UNOWED_WINDOW_ROLES`), so on
         # this path the reduction's remaining job is folding the chunk runs.
+        #
+        # CLIENT DEPENDENCY on this collapse shape: while a slot streams, the
+        # in-flight chunk run folds into ONE trailing row that carries no durable
+        # `meta.mid`, and the bounded window ends in it. The dashboard's
+        # `warmSlotCache` (website/src/store/chatSlice.ts) sizes its count-matched
+        # request to the durable rows a pane holds and asks for ONE EXTRA row on a
+        # running slot so the folded row does not displace a durable one out of
+        # the window. A change here that folds the run into more than one row, or
+        # stops folding, moves that `+1` out of step with the response.
         all_msgs = await asyncio.to_thread(_collapse_wire_rows, all_msgs)
         total = len(all_msgs)
         if before is not None:
@@ -2638,7 +2652,12 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     running = slot.running
     stopping = slot._stopping
     display_title = slot.display_title
-    queue_snapshot = [{"id": q["id"], "content": q["content"]} for q in slot._queue]
+    # Shallow copies, so the off-loop render below reads a frozen entry while
+    # the loop keeps editing the live one; the view helper does the redaction.
+    queue_snapshot = [
+        {"id": q["id"], "content": q["content"], "meta": dict(q.get("meta") or {})}
+        for q in slot._queue
+    ]
     context_fields = await _context_snapshot_fields(state, slot)
 
     def _render(live_child: str) -> str:
@@ -2659,10 +2678,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                 "running": running,
                 "stopping": stopping,
                 "messages": prepared,
-                "queue": [
-                    {"id": q["id"], "content": _redact_for_display(q["content"])}
-                    for q in queue_snapshot
-                ],
+                "queue": [queue_entry_view(q) for q in queue_snapshot],
                 "total": total,
                 "has_more": has_more,
                 "next_before": next_before,
@@ -3902,6 +3918,12 @@ async def _persist_handover_tail(
             best_effort=False,
             expected_history_key=history_key,
             rows_only=True,
+            # This frame IS the retraction's drain, so the close's guarded-write
+            # fence does not apply to it: the close raised that fence, sequenced
+            # this write itself, and nothing in the process can reach these rows
+            # again. Refusing here would drop exactly the rows this function
+            # exists to save.
+            issued_by_the_retraction=True,
         )
     except Exception:
         logger.error(
@@ -4926,6 +4948,14 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
     slow the press was refused with a 503 forever while typing the same request by
     hand worked. The unequal treatment of two paths that dispatch the same turn is
     the bug; the transcript's own error card is the report either way.
+
+    The one refusal that reads the transcript's content is a different thing
+    from a readiness gate: ``session_start_repeat`` fires only when the slot's
+    OWN tail holds two ``session_start_failed`` error rows with nothing but
+    recovery rows between them -- the same start, re-issued by Resume, failed
+    twice. That is not a probe that can be wrong forever; it is the record of
+    what this endpoint itself just did twice. A typed message stays allowed and
+    resets the count, so the refusal never latches the slot.
     """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
@@ -5021,6 +5051,30 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "nothing to continue", "code": "slot_empty"}, status=409
             )
+        # The same session start has already failed twice in a row with nothing
+        # but Resume presses between the attempts. Continue would re-issue the
+        # identical ``session/new`` a third time: the turn has no registered
+        # session, so it starts one, and nothing about the request changed
+        # since the last two walls. This is the one refusal that reads the
+        # transcript's CONTENT rather than its shape, and it is not a
+        # readiness gate (see the docstring): the evidence is the slot's own
+        # two tagged rows, not a probe that can be wrong forever, and typing a
+        # message is still allowed -- a user row ends the streak, so a typed
+        # retry that fails once gets its Resume back. The first failure keeps
+        # today's behaviour exactly: one Resume, same continuation, same words.
+        failures = session_start_failure_streak(slot.messages)
+        if failures >= _SESSION_START_REPEAT_REFUSAL_AT:
+            return web.json_response(
+                {
+                    "error": (
+                        f"the agent session failed to start {failures} times in a "
+                        "row; Resume would run the same start again. Restart the "
+                        "gateway (kirocrew restart), then send your message again."
+                    ),
+                    "code": "session_start_repeat",
+                },
+                status=409,
+            )
 
         # _is_interrupted does not AUTHORIZE the continue — it only picks which
         # body to inject. Both are true statements about their own case, and
@@ -5060,6 +5114,70 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
         logger.info("continue: queue entry consumed by a concurrent dequeue (slot %s)", name)
     state.push_slots_update()
     return web.json_response({"ok": True, "slot": slot.key})
+
+
+#: Consecutive tagged session-start failures at which Continue stops re-running
+#: the start. Two, not one: a single timed-out start is host weather and the
+#: first Resume is exactly the retry it deserves; the second identical failure
+#: is the signal that nothing a retry can change is wrong. Mirrored by
+#: ``SESSION_START_REPEAT_REFUSAL_AT`` in ``website/src/pages/chat/ErrorCard.tsx``.
+_SESSION_START_REPEAT_REFUSAL_AT = 2
+
+#: ``inject`` kinds that begin a turn of their own rather than continuing the
+#: one above them -- the mirror of ``INJECT_KIND_OPENS_TURN`` in
+#: ``website/src/pages/chat/RecoveryCard.tsx`` (``recovery`` and
+#: ``user_replay`` continue the same turn and are deliberately absent).
+_TURN_OPENING_INJECT_KINDS = frozenset({"cron", "synthesis"})
+
+
+def session_start_failure_streak(messages: list[dict]) -> int:
+    """How many session starts in a row failed at the tail of *messages*.
+
+    Walks back from the newest row counting ``error`` rows stamped with
+    ``SESSION_START_FAILED_KIND`` (the structural tag ``chat_runner`` writes
+    from the exception, never from the prose). Every row that is not the
+    conversation's floor is walked past -- the ``inject`` row a Resume press
+    lands as, tool rows, notices -- so two failures separated only by the user
+    pressing Resume are consecutive. The walk stops at the first row that IS
+    new information: a user or assistant row with content (a typed retry is a
+    new attempt and starts the count over), an error row of any OTHER kind (a
+    connection-lost row is a different failure, not a third start), or a row
+    that OPENS a turn of its own -- a nudge, a sub-agent completion, or an
+    ``inject`` whose kind begins new work (``_TURN_OPENING_INJECT_KINDS``,
+    the mirror of ``INJECT_KIND_OPENS_TURN`` in ``RecoveryCard.tsx``) -- since
+    a failure before such a row belongs to a different turn and must not cost
+    this turn its first Resume. A ``recovery`` inject resumes the SAME turn and
+    is walked past, which is what makes two Resume-separated failures
+    consecutive.
+
+    The transcript is the count because nothing else can hold it: a start
+    that never answered registered no session, so the per-session
+    ``consecutive_failures`` counter in ``SessionManager.record_failure`` is
+    never reached for it. Mirrors ``sessionStartFailureStreak`` in
+    ``website/src/pages/chat/ErrorCard.tsx``; the two must agree, or the card
+    hides a Resume the server would have honoured (or offers one it refuses).
+    """
+    streak = 0
+    for m in reversed(messages):
+        role = m.get("role")
+        meta = m.get("meta")
+        if role == "error":
+            kind = meta.get("kind") if isinstance(meta, dict) else None
+            if kind == SESSION_START_FAILED_KIND:
+                streak += 1
+                continue
+            break
+        if is_stop_event_row(m):
+            break
+        if role in ("nudge", "subagent"):
+            break
+        if role == "inject" and (
+            isinstance(meta, dict) and meta.get("injectKind") in _TURN_OPENING_INJECT_KINDS
+        ):
+            break
+        if role in ("user", "assistant") and m.get("content") and not is_system_notice(role, meta):
+            break
+    return streak
 
 
 def _has_conversation(slot: _ChatSlot) -> bool:
@@ -5482,13 +5600,26 @@ async def api_chat_slot_queue_edit(request: web.Request) -> web.Response:
     # The stored text is what the edit normalized to (attachment markers are
     # renumbered when the edit dropped one), so the row and the broadcast echo
     # the ENTRY, not the request body.
-    stored = next((i.get("content") for i in slot._queue if i["id"] == queue_id), None)
+    entry = next((i for i in slot._queue if i["id"] == queue_id), None)
+    stored = entry.get("content") if entry is not None else None
     if isinstance(stored, str):
         content = stored
     _edit_queued_by_id(slot.messages, queue_id, content)
     slot.invalidate_source_links()
     _redacted = _redact_for_display(content)
-    state.broadcast_ws("queue_edit", {"slot": name, "queue_id": queue_id, "content": _redacted})
+    frame: dict[str, Any] = {"slot": name, "queue_id": queue_id, "content": _redacted}
+    # The edit prunes and renumbers the entry's attachment lists alongside the
+    # text (`prune_attachment_meta`), so the frame carries the lists the
+    # renumbered markers now index -- the client replaces the row's lists from
+    # it. Same `meta` shape and redaction as `queue_entry_view`, read straight
+    # off the entry so the content is not redacted a second time. Absent when
+    # the entry has none left (or never had any): the client reads absence on
+    # THIS frame as "no lists", so a row whose markers the edit all removed
+    # drops its stale lists too.
+    _edit_attachments = attachment_meta(entry.get("meta")) if entry is not None else {}
+    if _edit_attachments:
+        frame["meta"] = _edit_attachments
+    state.broadcast_ws("queue_edit", frame)
     state.push_slots_update()
     sel().log_tool_invocation(
         session_key=f"dashboard:{name}",
@@ -5896,7 +6027,7 @@ class SlotCloseError(Exception):
     would have rendered.
 
     Extracted alongside :func:`close_slot` so the DELETE endpoint and
-    session-control's ``close_target`` map the SAME three failures the same way.
+    session-control's ``close_target`` map the SAME four failures the same way.
     ``code`` is the machine-readable contract; ``message`` is advisory prose;
     ``status`` is 500 for every close failure (each leaves the tab open and
     every partial step rolled back — a state the user can see and retry).
@@ -5955,6 +6086,78 @@ def _release_closed_execution(
         release_closed_execution()
 
 
+# Ceiling on how long a close waits for this slot's guarded history writes to
+# finish. The wait is bounded so a genuinely stuck write cannot hang the tab
+# close: on breach the close is REFUSED and rolled back, which returns promptly
+# and leaves the tab the user still has open, rather than retracting the name
+# while a worker thread is still on its way to the rename.
+_GUARDED_WRITE_WAIT_SECS = 5.0
+
+
+def _pending_guarded_history_writes(slot: "_ChatSlot") -> set:
+    """This slot's guarded history writes that have not finished yet.
+
+    Read SYNCHRONOUSLY, which is what lets a caller decide against a fenced slot
+    with no suspension between the read and its decision. Anything that is not a
+    real set is an absent registry, the same rule the writer applies when it
+    registers a future.
+    """
+    writes = getattr(slot, "_guarded_history_writes", None)
+    if type(writes) is not set:
+        return set()
+    return {write for write in writes if not write.done()}
+
+
+async def _await_guarded_history_write(slot: "_ChatSlot", name: str) -> bool:
+    """Wait for this slot's guarded history writes to finish; True when none is left.
+
+    ``save_slot_off_loop`` runs a guarded write (one carrying an authorized
+    transcript key, which is every truncating save) on a worker thread, and that
+    write re-reads the slot map INSIDE the transcript lock to confirm it still
+    owns the key. The map is event-loop state, so a retraction landing between
+    that re-read and the write's rename commits a truncated snapshot onto
+    whatever adopts the key next, and a same-name replacement that resumes the
+    same transcript inherits the truncation durably.
+
+    Waiting here inverts the guard: the retraction waits for the write instead of
+    the write trying to observe the retraction.
+
+    The wait is on the writes' executor FUTURES, which complete with the worker
+    thread. ``_metadata_persist_inflight`` cannot serve here even though it
+    counts the same writes: it is released in the awaiting coroutine's
+    ``finally``, so a handler cancelled mid-write reads as zero while its thread
+    runs on -- precisely the case this wait exists for.
+
+    Callers must fence the slot before calling, or a fresh write can be admitted
+    into the wait. A ``False`` return means writes are still outstanding, and the
+    caller must NOT retract the name.
+    """
+    deadline = time.monotonic() + _GUARDED_WRITE_WAIT_SECS
+    waited = False
+    while True:
+        pending = _pending_guarded_history_writes(slot)
+        if not pending:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning(
+                "Slot %s close refused: %d guarded history write(s) still running "
+                "after %.1fs, so retracting the name now could commit a truncated "
+                "snapshot onto whatever adopts this key next",
+                name,
+                len(pending),
+                _GUARDED_WRITE_WAIT_SECS,
+            )
+            return False
+        if not waited:
+            waited = True
+            logger.debug("Slot %s close waiting for a guarded history write", name)
+        # Wait on the futures themselves rather than polling a counter: a future
+        # already awaited elsewhere admits further waiters, and this returns the
+        # moment the worker finishes instead of on the next poll tick.
+        await asyncio.wait(pending, timeout=remaining)
+
+
 async def close_slot(
     state: DashboardState,
     slot: "_ChatSlot",
@@ -5987,7 +6190,7 @@ async def _close_slot(
 
     Shared by :func:`api_chat_slot_delete` and ``session_control.close_target``
     so neither can diverge on the ordering invariants that keep a nudge or an
-    app watchdog from resurrecting the very tab being dismissed. The three
+    app watchdog from resurrecting the very tab being dismissed. The four
     failure paths raise :class:`SlotCloseError`, leaving the slot open with every
     partial step rolled back; the caller renders the refusal in its own idiom
     (an HTTP response, or a ``SessionControlError``). The APP-OWNERSHIP check is
@@ -6026,6 +6229,27 @@ async def _close_slot(
     # close observed the already-terminal record, leaving an active orphan.
     slot.begin_close()
     closed_at = note_slot_closed(state, name)
+    # The fence above is what makes this wait sound: it refuses a NEW truncating
+    # save for the duration of the teardown, so the writes this drains cannot be
+    # re-armed behind it. Placed here, after the synchronous tombstone and before
+    # the retirement awaits, it adds no suspension near the pop: the pre-pop
+    # re-check and the retraction stay adjacent, which is what keeps a retired
+    # nudge loop and a late channel mirror from slipping between them.
+    #
+    # A breach REFUSES the close instead of proceeding. Proceeding would retract
+    # the name with a worker thread still short of its rename, which is the
+    # unrecoverable case this whole wait exists to prevent: the replacement
+    # resumes from the file that worker rewrites, and nothing retries or
+    # self-corrects on that path. Refusing is recoverable by contrast -- the tab
+    # stays open with every step so far rolled back, and the person can close it
+    # again -- and it returns within the ceiling, so a stuck write delays the
+    # close rather than hanging it.
+    if not await _await_guarded_history_write(slot, name):
+        raise SlotCloseError(
+            "a history write for this conversation is still running; the tab stays "
+            "open, close it again in a moment",
+            code="history_write_running",
+        )
     from kiro_crew.execution_context import read_live_session_execution
 
     closing_key = effective_session_key(slot)
@@ -6429,11 +6653,12 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
     try:
         await close_slot(state, slot, name)
     except SlotCloseError as exc:
-        # Every failure `close_slot` raises is a server-side 500 (nudge retire /
-        # app hook / history save); a literal status keeps the error-code contract
-        # gate able to verify the `code` statically (a `status=<expr>` would read
-        # as an un-verifiable dynamic-status response). The pre-pop re-check that
-        # raises other statuses is session-control's path, not this handler's.
+        # Every failure `close_slot` raises is a server-side 500 (history write
+        # running / nudge retire / app hook / history save); a literal status keeps
+        # the error-code contract gate able to verify the `code` statically (a
+        # `status=<expr>` would read as an un-verifiable dynamic-status response).
+        # The pre-pop re-check that raises other statuses is session-control's
+        # path, not this handler's.
         return web.json_response({"error": exc.message, "code": exc.code}, status=500)
     return web.json_response({"ok": True})
 
@@ -6561,10 +6786,43 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             continue
         closing_key = effective_session_key(candidate)
         closing_execution = read_live_session_execution(closing_key)
-        if state._slots.get(name) is not candidate:
+        if candidate.is_closing:
+            # Another retraction already owns this slot -- a close the person
+            # asked for, suspended inside its own wait for guarded writes. Leave
+            # it alone: it is being archived anyway, and two retractions racing
+            # one name is what the fence exists to prevent, not something to join.
+            continue
+        # Fence, then decide SYNCHRONOUSLY, then pop -- with no await in
+        # between. A sweep has no obligation to finish this retraction, unlike a
+        # close the person asked for, so it does not wait for a guarded write: it
+        # defers the slot to the next sweep.
+        #
+        # Waiting here would be worse than useless. The handlers that produce a
+        # guarded write publish a task on the same slot in the same breath, so a
+        # pending write and a live turn co-occur by construction; a wait would
+        # hold the sweep open exactly while the tab is being edited, and the pop
+        # after it would cancel that turn. Deferring removes the window rather
+        # than re-checking for it, and a pending guarded write is itself proof the
+        # tab is not idle, whatever its last recorded activity says.
+        #
+        # The fence is what makes the synchronous read sound: with it up, no NEW
+        # guarded write can be dispatched (the saver refuses one, and rewind
+        # refuses at admission and again at its dispatch seam), so an empty
+        # reading stays empty through the pop below.
+        candidate.begin_close()
+        if _pending_guarded_history_writes(candidate) or state._slots.get(name) is not candidate:
+            candidate.cancel_close()
+            if state._slots.get(name) is candidate:
+                logger.info(
+                    "Cleanup: slot %s has a history write in flight, so it is not idle; "
+                    "leaving it for the next sweep",
+                    name,
+                )
+                failed.append(name)
             continue
         removed = state._slots.pop(name, None)
         if not removed:
+            candidate.cancel_close()
             continue
         # Same tombstone as the single-tab close: the archive pass must not
         # race a concurrent channel reconcile into resurrecting the slot. Its
@@ -6649,6 +6907,10 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             # original object we hold.
             if _slot_still_ours(state, name, removed):
                 state._slots[name] = removed
+                # The slot is live under its own name again, so its close is
+                # over: release the admission fence or the restored tab refuses
+                # every regenerate, edit-resend and rewind for good.
+                removed.cancel_close()
             else:
                 # The restore is what this arm's own comment relies on to keep the
                 # flushed notes reachable ("restores the slot with its notes still
@@ -10615,10 +10877,7 @@ async def _live_slot_resume_response(
                 "ok": True,
                 "key": existing.key,
                 "messages": prepared,
-                "queue": [
-                    {"id": q["id"], "content": _redact_for_display(q["content"])}
-                    for q in existing._queue
-                ],
+                "queue": [queue_entry_view(q) for q in existing._queue],
                 "total": total,
                 "has_more": next_before > 0,
                 "next_before": next_before,
@@ -11583,9 +11842,7 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             "messages": _prepare_messages(
                 recent, slot.running, live_child=_live_child_instance(state, slot)
             ),
-            "queue": [
-                {"id": q["id"], "content": _redact_for_display(q["content"])} for q in slot._queue
-            ],
+            "queue": [queue_entry_view(q) for q in slot._queue],
             "total": total,
             "has_more": total > len(recent),
             "memory_mode": slot.memory_mode,

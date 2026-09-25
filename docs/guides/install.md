@@ -89,11 +89,13 @@ Global V1 retains its existing session-start memory retrieval. Crew Member V2
 injects current persona, permanent rules and admitted project guides every turn;
 facts and past experiences are retrieved through the explicit `memory_recall`
 tool. All stores share one model and inference worker. The interactive
-`memory.embedding_threads` default is 4, capped at one core below the host's
-CPU count -- never below one thread -- so the event loop keeps a core wherever
-there is one to spare; `memory.embedding_bulk_threads` remains 1. The value 4 means that default policy, so pinning threads on a host
-with 4 or fewer cores takes a different number; any other explicit setting is
-honored up to the full CPU count. Bulk threads may be 0 to inherit the normal
+`memory.embedding_threads` default is 4, capped at one core below the CPUs the
+process may run on -- which a CPU-set restriction (`--cpuset-cpus`, `taskset`)
+narrows below the host's core count -- and never below one thread, so the event
+loop keeps a core wherever
+there is one to spare; `memory.embedding_bulk_threads` remains 1. The value 4 means that default policy, so pinning threads
+where the process may use 4 or fewer CPUs takes a different number; any other explicit setting is
+honored up to that same count. Bulk threads may be 0 to inherit the normal
 setting. Background jobs share the configured bulk
 duty cycle, while waiting interactive queries take priority. A full inference
 queue leaves new rows pending and permits keyword retrieval, so additional
@@ -819,8 +821,20 @@ For remote hosts, see [remote-and-mobile.md](remote-and-mobile.md).
 ## Linux: the agent sandbox and unprivileged user namespaces
 
 On Linux, Kiro Crew isolates the agent by entering a **user namespace** and then
-a **mount namespace**, over-mounting credential paths such as `~/.aws` and
-`~/.ssh` so the agent cannot read them. If that sandbox cannot be built,
+a **mount namespace**, over-mounting credential paths with empty directories so
+the agent cannot read them. Which paths depends on the tier: the default
+`agent.sandbox: "auto"` runs the **standard** tier, which hides `~/.gnupg`,
+`~/.docker`, `~/.azure`, `~/.config/gcloud` and Kiro Crew's own secret vault but
+deliberately leaves `~/.aws`, `~/.ssh` and `~/.kube` visible so the `aws` CLI,
+`credential_process`, git-over-SSH and `kubectl` keep working inside the agent.
+`agent.sandbox: "strict"` additionally hides `~/.aws` (including the
+`sso/cache` grant store remote-MCP OAuth uses), `~/.ssh` (except
+`known_hosts`), `~/.kube`, `~/.config/gh` and the credential files `~/.npmrc`,
+`~/.pypirc`, `~/.netrc` and `~/.git-credentials`, and the tools that read them
+stop working inside the agent as a result; it applies to sessions started after
+the change. See the
+[Sandbox section of the configuration guide](../../src/kiro_crew/docs/configuration.md#sandbox).
+If the sandbox cannot be built,
 Kiro Crew **refuses to run the agent** rather than run it unisolated: spawns fail
 closed. This is deliberate and is not something to work around casually.
 

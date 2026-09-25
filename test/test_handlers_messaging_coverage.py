@@ -33,6 +33,13 @@ import kiro_crew.dashboard.handlers.messaging as mod
 from conftest import forget_env_at_teardown
 from kiro_crew.subagent import AGENT_NOT_FOUND_CODE
 
+#: The subject every request double presents, and the id ``_state`` reports as its
+#: owner. These suites exercise body validation and response shape, not
+#: authorization, so the caller they model is the owner's own dashboard session --
+#: the one the owner gate admits. A test that means to model somebody else passes
+#: its own ``extra={"user": ...}``.
+_OWNER_SUBJECT = "U0OWNER0000"
+
 
 class _Req:
     """Request double: state, JSON body, route/query fields and headers."""
@@ -53,10 +60,15 @@ class _Req:
         self.query = query or {}
         self.headers: dict[str, str] = {}
         self.remote = remote
-        self._extra = {"app": "", **(extra or {})}
+        self._extra = {"app": "", "user": _OWNER_SUBJECT, **(extra or {})}
 
     def __contains__(self, key: str) -> bool:
         return key in self._extra
+
+    def __getitem__(self, key: str) -> Any:
+        # The owner predicate reads ``request["app"]`` directly after testing
+        # membership, so the double needs the read as well as the ``in``.
+        return self._extra[key]
 
     async def json(self) -> Any:
         if isinstance(self._body, BaseException):
@@ -90,6 +102,7 @@ def _payload(resp: web.Response) -> Any:
 def _state(**kw: Any) -> Any:
     """A DashboardState double with the JSON-serializable fields pinned."""
     state = MagicMock()
+    state.owner_id = _OWNER_SUBJECT
     state.subagents = None
     state.slack_client = None
     state._native_cards = {}
@@ -259,6 +272,33 @@ class TestApiSpawn:
         req = _Req(_state(subagents=mgr), {"task": "x", "batch_total": "many"})
         assert _run(mod.api_spawn, req).status == 200
         assert mgr.spawn.call_args.kwargs["batch_total"] == 0
+
+    def test_a_deferred_row_answers_queued_with_the_gate_reason(self) -> None:
+        """The memory guard parked the row: the caller is told it WAITS and why,
+        under the same ``id`` (the wave reconcile and the run card key on it)."""
+        mgr = _mgr()
+        mgr.spawn.return_value = _info(
+            id="q1",
+            queued=True,
+            queued_reason="low_memory",
+            queued_reason_detail="low memory: 3.2 GB available, need 4 GB",
+        )
+        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"}))
+        assert resp.status == 200
+        body = _payload(resp)
+        assert body["id"] == "q1"
+        assert body["status"] == "queued"
+        assert body["reason"] == "low_memory"
+        assert body["reason_detail"] == "low memory: 3.2 GB available, need 4 GB"
+
+    def test_a_capacity_queued_row_still_answers_spawned(self) -> None:
+        """Waiting behind the cap for a stagger tick is the ordinary wave shape;
+        its wire answer does not change."""
+        mgr = _mgr()
+        mgr.spawn.return_value = _info(id="q2", queued=True, queued_reason="concurrency_limit")
+        body = _payload(_run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"})))
+        assert body["status"] == "spawned"
+        assert "reason" not in body
 
     @pytest.mark.parametrize("source", ["crew", "subagent"])
     @pytest.mark.parametrize("unavailable", [False, True])

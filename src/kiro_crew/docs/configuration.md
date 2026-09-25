@@ -64,16 +64,44 @@ value and the notice with it.
 ## Sandbox
 
 `agent.sandbox` controls whether Kiro Crew wraps the agent process in its own
-OS-level sandbox (a user namespace on Linux, `sandbox-exec` on macOS).
+OS-level sandbox (a user namespace on Linux, `sandbox-exec` on macOS), and how
+much of your home directory that sandbox hides from the agent's subprocesses.
 
 | Value | Behavior |
 |-------|----------|
-| `auto` (default) | Add the Kiro Crew OS-level sandbox; on macOS it defers to the kiro-cli internal sandbox when that is enabled |
+| `auto` (default) | Add the Kiro Crew OS-level sandbox at the **standard** tier; on macOS it defers to the kiro-cli internal sandbox when that is enabled |
+| `strict` | Add the Kiro Crew OS-level sandbox at the **strict** tier: everything `standard` hides, plus `~/.aws` (including `~/.aws/sso/cache`, kiro-cli's grant store for OAuth-connected remote MCP servers), `~/.ssh` (only `known_hosts` stays readable), `~/.kube`, `~/.config/gh`, and the credential files `~/.npmrc`, `~/.pypirc`, `~/.netrc`, `~/.git-credentials` |
 | `off` | Skip the Kiro Crew OS-level sandbox |
+
+**What the default leaves visible, and why.** The standard tier hides
+`~/.gnupg`, `~/.docker`, `~/.azure`, `~/.config/gcloud`, the crew secret vault
+and the governance cache. It deliberately does **not** hide `~/.aws`, `~/.ssh`
+or `~/.kube`: the `aws` CLI, boto3 and `credential_process`, git-over-SSH and
+`kubectl` all read those directories, and an agent that cannot reach them
+cannot debug or deploy the way you would. Kiro Crew's file tools still refuse to
+open paths under them, and the AWS/SSH environment-variable, SDK and
+exfiltration command shapes are denied at the tool gate, but a plain shell read
+(`cat ~/.aws/credentials`) is not fenced at this tier — the OS sandbox is the
+enforcement point, and standard does not seal that directory.
+
+**When to use `strict`.** Set it when the host holds credentials the agent must
+never read, and you accept that inside the agent the `aws` CLI, boto3,
+git-over-SSH, `gh`, `kubectl`, npm/pip registry auth (`~/.npmrc`, `~/.pypirc`),
+`.netrc` HTTPS auth, the git credential store (`~/.git-credentials`) and
+OAuth-connected remote MCP servers (their grants live in `~/.aws/sso/cache`)
+stop working — they cannot see their config, keys or tokens, even though the
+gateway-side Connections page, which reads your real home, still shows the grant.
+It is opt-in and per host; nothing changes for you until you set it.
+Like every value of this key, a change applies to sessions started after it: a
+session already running keeps the tier it was spawned with until it ends, so
+restart the sessions (or the gateway) you want confined at the new tier.
+`strict` only tightens where Kiro Crew's own sandbox is what confines the
+spawn: on Windows there is no OS backend, and a macOS spawn delegated to
+kiro-cli's internal sandbox is confined by that profile instead.
 
 The two layers are mutually exclusive on macOS because a nested seatbelt sandbox fails with `EPERM`. The default is `auto`: it uses the Kiro Crew sandbox where available and defers to the kiro-cli internal sandbox on macOS when that sandbox is enabled.
 
-Set via `kirocrew config set agent.sandbox auto`.
+Set via `kirocrew config set agent.sandbox auto` (or `strict`, or `off`).
 
 ## ACP Backend
 
@@ -171,7 +199,8 @@ Set a registered value with, for example,
     "history_max_days": 365,
     "persistence_enabled": true,
     "inject_memory": true,
-    "inject_lessons": true
+    "inject_lessons": true,
+    "inject_activity": true
   },
   "skills": {
     "max_triggered": 0
@@ -194,10 +223,11 @@ Set a registered value with, for example,
 |-----|-------------|---------|
 | `agent.provider` | LLM provider backend. `"acp"` (KiroACP / kiro-cli) is the only accepted value | `"acp"` |
 | `agent.default_agent` | Default agent name for new sessions. Empty resolves from the agent config | `""` |
+| `agent.deepseek_env` | Provider keys handed to the DeepSeek Harness (`agent.acp_backend: deepseek`) as environment variables at spawn: a map of environment-variable NAME to a `secret://<vault name>` reference. Store the key under Settings → Secrets first, then map it — e.g. `{"DEEPSEEK_API_KEY": "secret://my-dsh-key"}`. Any provider name the harness knows works. A plaintext value is refused at write time — the `config set` itself fails, so no key is ever stored in `config.json` — and, at spawn, so is a name the harness would forward to its own shell children, a name Kiro Crew sets itself, or one Kiro Crew's agent environment scrub strips: the session is refused before it starts, naming the offending key. Empty means no key — a locally served model needs none. Other backends ignore it | `{}` |
 | `agent.approval_mode` | `"auto"` or `"interactive"` | `"auto"` |
 | `agent.model` | Default LLM model for new sessions. `"auto"` defers to the agent config, then to Kiro's own default. Editable from Settings → Chat → Model; a per-session model picker overrides it for that session only | `"auto"` |
 | `agent.reasoning_effort` | Default reasoning effort on models that support it. One of `""`, `low`, `medium`, `high`, `xhigh`, `max`; `""` defers to the provider/model default. A per-session override wins | `""` |
-| `agent.sandbox` | `"auto"` (use Kiro Crew OS-level sandbox, or defer to the kiro-cli internal sandbox on macOS) or `"off"` (skip the Kiro Crew sandbox) | `"auto"` |
+| `agent.sandbox` | `"auto"` (Kiro Crew OS-level sandbox at the standard tier, which leaves `~/.aws`/`~/.ssh`/`~/.kube` visible for credential tooling; defers to the kiro-cli internal sandbox on macOS), `"strict"` (also hides `~/.aws` incl. `sso/cache`, `~/.ssh` bar `known_hosts`, `~/.kube`, `~/.config/gh`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`, `~/.git-credentials`), or `"off"` (skip the Kiro Crew sandbox). Applies to sessions started after the change. See [Sandbox](#sandbox) | `"auto"` |
 | `agent.streaming` | Stream response text as it is generated | `true` |
 | `agent.bot_name` | Custom name the bot identifies as | `""` |
 | `agent.session_sharing` | Reuse a shared ACP runtime for subagents on the kiro-cli backend; alternate ACP backends ignore it | `true` |
@@ -245,7 +275,6 @@ Set a registered value with, for example,
 | `dashboard.merge_queued_messages` | Concatenate follow-up messages while the agent is busy | `false` |
 | `dashboard.mcp_probe_timeout_secs` | Seconds to wait for an MCP server handshake during a probe (5-120) | `15` |
 | `dashboard.link_previews` | Fetch and render HTTP(S) link metadata in assistant messages. Off by default because each linked site receives a request from this machine | `false` |
-| `dashboard.usage_text_scrape_enabled` | Let the top-bar credit pill fall back to a `kiro-cli /usage` chat turn when the free usage API returns no plan. That fallback is a real billed LLM turn and it repeats every refresh interval, so it is off by default. Editable at Settings > Display > View | `false` |
 | `dashboard.feature_videos_enabled` | Play a short intro clip for a feature this install has not used yet. Instance-wide kill switch; see [Feature Videos](feature-videos.md). Off until real clips ship | `false` |
 | `dashboard.link_patterns` | Rewrite matching plain text in transcripts into links at display time, through the same autolink rule engine editions register vocabulary on. Each rule pairs a JavaScript regex with an absolute http(s) URL template in which `{match}` inserts the matched text percent-encoded (no userinfo, placeholder outside the host), e.g. `{"pattern": "\\bPROJ-\\d+\\b", "url": "https://tracker.example.com/browse/{match}"}`. Code blocks and existing links are never rewritten; an inline code span whose whole text matches becomes a link chip. At most 50 rules with distinct patterns, each carrying at most one wide quantifier (`*`, `+`, `{n,}` or a wide `{n,m}`; narrow ranges may accompany it), scanning at most 2000 characters per text block | `[]` |
 | `dashboard.feature_videos_cache_max_mb` | Disk budget for downloaded clips. Whole release folders are removed oldest-first to fit; the release you are running is never removed. `0` = no cap | `500` |
@@ -395,7 +424,7 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 |-----|-------------|---------|
 | `memory.embedding_provider` | Vector embedding backend. `"llama_cpp"` is the only accepted value; any other value in an existing config (including a legacy `"ollama"` or `"none"`) is coerced to it on load | `"llama_cpp"` |
 | `memory.embedding_dim` | Output width of the embedding model in use. Must match a custom model's real width, or the load is refused | `1024` |
-| `memory.embedding_threads` | CPU threads llama.cpp may use per embedding call; explicit settings are clamped to the machine core count | `4` |
+| `memory.embedding_threads` | CPU threads llama.cpp may use per embedding call; explicit settings are clamped to the CPUs the process may run on, which a CPU-set restriction (`--cpuset-cpus`, `taskset`) narrows below the host's cores | `4` |
 | `memory.embedding_bulk_threads` | Threads used for background embedding; `0` inherits `embedding_threads` | `1` |
 | `memory.embedding_bulk_duty` | Target fraction of worker time spent on background embedding; interactive queries take priority | `0.2` |
 | `memory.embed_model_url` | Override HTTPS URL for the embedding-model GGUF download (mirrored or airgapped hosts). Empty uses the public Kiro Crew CDN. `KIROCREW_EMBED_MODEL_URL` wins over both. Downloads are sha256-verified regardless of source | `""` |
@@ -413,6 +442,7 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.persistence_enabled` | Global switch for persistent memory. Off: no automatic memory writes anywhere — `learn_add` and `kirocrew learn add` refuse, history consolidation pauses entirely (no LLM turn spent), task-runner lesson extraction skips — and stored memory/lessons are not injected into new sessions. Within-conversation context is unaffected, and explicit dashboard edits/deletions (the right to forget) stay available. One documented exception: an installed app's own ingestion sweep (Ops Mission Control's ledger import) still writes app-scoped episodic rows, because it is reached only through that app's trigger | `true` |
 | `memory.inject_memory` | Inject the stored memory block (preferences, the memory activity index, recent-session snippets) into new-session context, including the re-injection after a compaction. On-demand `memory_recall` and writes are unaffected | `true` |
 | `memory.inject_lessons` | Inject the learned-corrections and user-profile blocks into new-session context. Writes are unaffected | `true` |
+| `memory.inject_activity` | Inject the recent activity block (active projects, daily history (14 full days, then decayed summaries and counts to day 180), task facts and relevant past episodes) into new-session context as a budgeted background block the context budget may drop whole. Off: only preferences and the activity index ship at session start, and older material is read through `memory_recall`. Requires `inject_memory` | `true` |
 
 Decay, episodic capacity eviction and history age pruning apply to V1 only.
 V2 keeps memory until explicit correction, replacement, forgetting or restoration.

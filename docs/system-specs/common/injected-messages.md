@@ -166,6 +166,12 @@ Three adjacent variants exist for a gateway restart, same prefix:
   holding an opening sentence; this variant exists so the parent is not sent to
   read a fragment as though it were the answer.
 - `❌ lost to gateway restart` plus `No result was captured before the restart.`
+  When the run's conversation is still resumable
+  (`session_map.session_files_resumable` on the orphan's `session_id` /
+  `provider`), one more line follows: how many turns it completed, its last
+  tool call, and the `spawn_continue(conversation="<id>", task=...)` handle
+  that resumes it — see `orphan_resume_hint` in
+  [subagent](../modules/subagent.md#gateway-restart-reconciliation).
 
 All three are redacted before any delivery path. When the parent has no open
 dashboard surface, undelivered notices are batched into a single digest DM rather
@@ -498,7 +504,7 @@ speech rather than as the user.
 | `[work ledger — …]` | `session_ledger.py` snapshot builder, composed into a nudge by `dashboard/handlers/autonudge.py` | Durable per-session state that outranks the model's recollection of earlier cycles. |
 | `[Hook context:]` … `[End of hook context]` | `context.py` hook-context assembly | Context supplied by a configured hook whose action is `HOOK_INJECT_CONTEXT`; webhook-restored workflow state is one producer, not the envelope's only meaning. The payload is untrusted third-party data. |
 | `[Previous run result — do NOT repeat the same content]` | `cron.py` | A recurring cron's own last output, so the turn reports only what changed. |
-| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold; take the lighter path this turn. |
+| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`; take the lighter path this turn. |
 | `[Relevant skills for this message]` | `skills.py` pointer renderer | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
 | `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and keeps nothing of the chat, its history or its lessons. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the ephemeral transcript. |
 

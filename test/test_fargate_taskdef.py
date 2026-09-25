@@ -23,6 +23,7 @@ OTHER_ACCOUNT = "210987654321"
 REGION = "us-east-1"
 DIGEST = "sha256:" + "b" * 64
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/kirocrew-crew@{DIGEST}"
+FILE_SYSTEM_ID = "fs-0123456789abcdef0"
 
 BINDING = CrewBinding(partition="aws", account=ACCOUNT, crew="frontdesk")
 OTHER_BINDING = CrewBinding(partition="aws", account=ACCOUNT, crew="backoffice")
@@ -43,6 +44,7 @@ def spec(**overrides) -> td.TaskDefinitionSpec:
         secrets=[secret_ref("frontdesk", td.MODEL_CREDENTIAL_ENV)],
         cpu_architecture="ARM64",
         log=td.default_log_spec(REGION),
+        store=td.StoreSpec(file_system_id=FILE_SYSTEM_ID),
     )
     base.update(overrides)
     return td.TaskDefinitionSpec(**base)  # type: ignore[arg-type]
@@ -67,6 +69,11 @@ FIELD_MUTATIONS = {
     ),
     "cpu_architecture": dict(cpu_architecture="X86_64"),
     "log": dict(log=td.LogSpec(region="eu-west-1", stream_prefix="p")),
+    # In the key: volumes and mountPoints are task-definition fields RunTask
+    # cannot override, and the store varies. The mutation is the ephemeral answer,
+    # which is the pair most expensive to confuse -- one revision serving both a
+    # persistent and a non-persistent data home.
+    "store": dict(store=None),
 }
 
 # What RunTask can override, mapped to the spec field name each would carry if
@@ -302,9 +309,10 @@ def test_a_log_configuration_region_is_refused_by_the_same_rule_as_an_arn_region
 
 
 def test_the_credential_env_name_matches_the_container_that_reads_it():
-    """A drift here delivers the secret under a name the backend does not read."""
+    """A drift here delivers the secret under a name the supervisor does not read."""
     constants = _env_constants(_container_module(_CREW_BACKEND_SOURCE))
-    assert td.MODEL_CREDENTIAL_ENV == constants["ENV_KIRO_API_KEY"]
+    assert td.MODEL_CREDENTIAL_ENV == constants["ENV_KIRO_IDENTITY"]
+    assert td.API_KEY_ENV == constants["ENV_KIRO_API_KEY"]
     assert td.CONTROL_SECRET_ENV == constants["ENV_CONTROL_SECRET"]
 
 
@@ -317,8 +325,10 @@ def _container_credential_env() -> set[str]:
     * ``build_backend_env`` POPS it from the model worker's environment. That
       worker auto-approves every tool it calls, so a name deliberately withheld
       from it is a name whose value must not be readable by prompt content.
-    * ``require_api_key`` refuses to start without it, which is the model
-      credential the task injects from Secrets Manager.
+    * ``seed_model_identity`` CONSUMES it from the supervisor's own environment, which
+      is how the model identity is delivered into the crew's vault. That name carries a
+      credential before it is withheld, so reading this function as well as the pop
+      keeps the DELIVERED name declared by the code that delivers it.
 
     Variables merely mentioned in ``build_backend_env`` do not qualify: it also
     sets the home, port, bind address and telemetry flag, none of which are
@@ -337,12 +347,12 @@ def _container_credential_env() -> set[str]:
         and isinstance(call.args[0], ast.Name)
         and call.args[0].id.startswith("ENV_")
     }
-    gated = {
+    delivered = {
         node.id
-        for node in ast.walk(_function(tree, "require_api_key"))
+        for node in ast.walk(_function(tree, "seed_model_identity"))
         if isinstance(node, ast.Name) and node.id.startswith("ENV_")
     }
-    return {constants[name] for name in popped | gated}
+    return {constants[name] for name in popped | delivered}
 
 
 def test_every_credential_the_container_reads_is_refused_here():
@@ -562,14 +572,16 @@ def test_the_init_process_is_on_the_definition_because_runtask_cannot_override_i
 def test_the_revision_scheme_was_bumped_when_the_document_gained_a_field():
     """A key computed under the old scheme must not describe the new document.
 
-    The hashed FIELDS did not change when ``initProcessEnabled`` was added, so
-    without a scheme bump a revision registered before the change carries an
-    IDENTICAL key while running a DIFFERENT document -- and a caller confirming
-    "revision N holds the content this spec describes" would accept a task with no
-    init process. The new field is a constant and so could never have
-    discriminated the two by being hashed; the scheme is the only thing that can.
+    Two separate reasons, and the scheme covers both. The hashed FIELDS did not
+    change when ``initProcessEnabled`` was added, so without a bump a revision
+    registered before it carries an IDENTICAL key while running a DIFFERENT
+    document, and a caller confirming "revision N holds the content this spec
+    describes" would accept a task with no init process. A constant could never
+    discriminate by being hashed. The store is the other case: the hashed fields DO
+    change, and the bump says so out loud rather than leaving a reader to notice
+    that every key moved.
     """
-    assert td.FINGERPRINT_SCHEME == 2
+    assert td.FINGERPRINT_SCHEME == 3
 
 
 def test_the_scheme_actually_participates_in_the_key(monkeypatch):

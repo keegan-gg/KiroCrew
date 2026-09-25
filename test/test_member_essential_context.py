@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew import context as context_module
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
 from kiro_crew.context import CONTEXT_GROUP_LESSONS, ContextBuilder
@@ -386,6 +386,282 @@ def test_execution_namespace_controls_member_prompt_identity(env, entrypoint, se
     env.forbidden.assert_not_called()
 
 
+def _delegate_expectations(prompt: str, store: str) -> None:
+    """The subset a template-selected delegate on a member's store receives.
+
+    Identity, `[PERMANENT RULES]`, the store's anchors and the selected template's
+    own instructions stay; the desk protocol and the briefing do not, in any of
+    their spellings (the full layer, the platform placeholder, the scope
+    placeholder), and neither does the rules header's reference to a protocol
+    that is not there.
+    """
+    assert "You are writer." in prompt
+    assert "A careful bilingual writer" in prompt
+    assert "[PERMANENT RULES" in prompt
+    assert "Do not publish drafts." in prompt
+    assert "Preference anchor" in prompt
+    assert "Execution task instructions." in prompt
+    assert "[HOW YOU WORK]" not in prompt
+    assert "Front desk vs workshop" not in prompt
+    assert "[CURRENT ASSIGNMENT" not in prompt
+    assert "working protocol above" not in prompt
+    assert prompt.count("[V2 ESSENTIAL CONTEXT") == 1
+    assert store in prompt or "memory_recall" in prompt
+
+
+def _template_delegate(config):
+    """The execution both delegate paths mint for a member caller naming a template.
+
+    `session_create(agent=<template>)` and the subagent admission gate agree on it:
+    the member's store and id stay, the selection namespace is the template's.
+    """
+    from dataclasses import replace
+
+    from kiro_crew.execution_context import resolve_member_execution
+
+    return replace(
+        resolve_member_execution(config, "writer"),
+        selection_kind="template",
+        selection_name="task-template",
+        template_id="task-template",
+    )
+
+
+@pytest.mark.parametrize(
+    "fresh, options",
+    [
+        (True, {}),
+        (False, {}),
+        (False, {"needs_reinjection": True}),
+        (True, {"resumed": True}),
+        (True, {"minimal_context": True}),
+    ],
+)
+def test_template_selected_delegate_keeps_identity_and_rules_but_not_the_desk_protocol(
+    env, fresh, options
+):
+    """The member's store under a selected template is the member's DELEGATE.
+
+    It reads and writes the member's memory, so it is that member and runs under
+    that member's rules; it was picked to do the work, so the desk protocol whose
+    second item hands substantial work to a separate session -- and the working
+    briefing that protocol maintains -- are withheld on every lifecycle the
+    envelope is rebuilt for.
+    """
+    delegate = _template_delegate(KiroCrewConfig.load())
+    prompt, _ = env.builder.build_message(
+        "Do the task",
+        fresh,
+        "dashboard:delegate",
+        execution_context=delegate,
+        agent="task-template",
+        project=str(env.project),
+        **options,
+    )
+    _delegate_expectations(prompt, env.store)
+    assert delegate.store.store_id == env.store
+    env.forbidden.assert_not_called()
+
+
+def test_template_selected_delegate_session_start_withholds_the_desk_protocol(env):
+    prompt = env.builder.build_session_context(
+        execution_context=_template_delegate(KiroCrewConfig.load()),
+        agent="task-template",
+        project=str(env.project),
+    )
+    _delegate_expectations(prompt, env.store)
+    env.forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("entrypoint", ["message", "session"])
+def test_member_selected_by_name_still_gets_its_whole_desk(env, entrypoint):
+    """The counterpart: a MEMBER selection keeps all four layers, protocol included."""
+    from kiro_crew.execution_context import resolve_member_execution
+
+    execution = resolve_member_execution(KiroCrewConfig.load(), "writer")
+    options = dict(execution_context=execution, project=str(env.project))
+    if entrypoint == "message":
+        prompt, _ = env.builder.build_message("Continue", True, **options)
+    else:
+        prompt = env.builder.build_session_context(**options)
+    assert "You are writer." in prompt
+    assert "[HOW YOU WORK]" in prompt
+    assert "Front desk vs workshop" in prompt
+    assert "[PERMANENT RULES" in prompt
+    assert "working protocol above included" in prompt
+    assert "[CURRENT ASSIGNMENT" in prompt
+    env.forbidden.assert_not_called()
+
+
+def test_a_delegate_with_memory_withheld_gets_no_layer_four_placeholder_either(env):
+    """The scope notice explains a member's missing layer 4; a delegate has none.
+
+    With the memory group withheld, the member selected by name is told why its
+    briefing is missing and not to fill the gap; the delegate on the same store
+    keeps identity and rules and gets no `[CURRENT ASSIGNMENT` line of any kind.
+    """
+    from kiro_crew.context import CONTEXT_GROUP_PROJECT
+    from kiro_crew.execution_context import resolve_member_execution
+
+    config = KiroCrewConfig.load()
+    options = dict(project=str(env.project), context_groups=frozenset({CONTEXT_GROUP_PROJECT}))
+    member_prompt, _ = env.builder.build_message(
+        "Continue", True, execution_context=resolve_member_execution(config, "writer"), **options
+    )
+    assert "withheld by this turn's memory/privacy scope]" in member_prompt
+    delegate_prompt, _ = env.builder.build_message(
+        "Do the task",
+        True,
+        execution_context=_template_delegate(config),
+        agent="task-template",
+        **options,
+    )
+    assert "You are writer." in delegate_prompt
+    assert "[PERMANENT RULES" in delegate_prompt
+    assert "[CURRENT ASSIGNMENT" not in delegate_prompt
+    assert "[HOW YOU WORK]" not in delegate_prompt
+    env.forbidden.assert_not_called()
+
+
+def test_spawn_agent_delegate_of_a_member_is_the_same_delegate(env):
+    """`spawn_run(agent=<template>)` from a member parent mints the same record
+    shape the session arm does, so the sub-agent's prompt withholds the same
+    layers -- one predicate, both delegate paths."""
+    from unittest.mock import MagicMock
+
+    from kiro_crew.execution_context import resolve_member_execution
+    from kiro_crew.subagent import SubagentManager
+
+    config = KiroCrewConfig.load()
+    parent = resolve_member_execution(config, "writer")
+    manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
+    admitted = manager._admission.resolve_spawn_execution(
+        parent_session_key="dashboard:writer", agent="task-template", _record=parent
+    )
+    assert admitted.selection_kind == "template"
+    assert admitted.member_id == parent.member_id
+    assert admitted.store == parent.store
+    prompt, _ = env.builder.build_message(
+        "Do the task",
+        True,
+        "subagent:delegate",
+        execution_context=admitted,
+        agent="task-template",
+        project=str(env.project),
+    )
+    _delegate_expectations(prompt, env.store)
+    env.forbidden.assert_not_called()
+
+
+def test_a_member_with_no_persisted_id_keeps_its_rules_when_session_create_names_a_template(
+    env,
+):
+    """The record shape the split cannot express, on the `session_create` arm.
+
+    A member whose record predates persisted identity is named by `selection_kind
+    == "member"` and `selection_name` alone. Rewriting those to the template's
+    namespace would leave a record ContextBuilder attributes to no member -- no
+    identity and, the part that matters, no `[PERMANENT RULES]`. The arm keeps the
+    selection and changes only the template (the record
+    `test_explicit_template_child_of_a_member_with_no_persisted_id_keeps_its_selection`
+    pins through the arm itself), so the child stays that member with its rules
+    and, the limit this states, its whole desk.
+    """
+    from dataclasses import replace
+
+    from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+    config = KiroCrewConfig.load()
+    config.agents["scribe"] = KiroCrewAgentConfig(
+        kiro_agent="critic-runtime", description="A scribe with no persisted identity"
+    )
+    config.save()
+    write_member_rules(slug_for_name("scribe"), member="scribe", text="Scribe: keep every draft.")
+    legacy = ExecutionContext(
+        None, MemoryStoreRef("default"), "member", "critic-runtime", selection_name="scribe"
+    )
+    child = replace(legacy, template_id="task-template")
+    prompt, _ = env.builder.build_message(
+        "Do the task",
+        True,
+        "session_create:delegate",
+        execution_context=child,
+        agent="task-template",
+        project=str(env.project),
+    )
+    assert "You are scribe." in prompt
+    assert "A scribe with no persisted identity" in prompt
+    assert "[PERMANENT RULES" in prompt
+    assert "Scribe: keep every draft." in prompt
+    assert "Execution task instructions." in prompt
+    assert "[HOW YOU WORK]" in prompt
+    env.forbidden.assert_not_called()
+
+
+def test_a_member_with_no_persisted_id_spawns_a_plain_template_child(env):
+    """The spawn gate's `agent=` child of such a member is a template run.
+
+    `with_template` flips the selection namespace for every record, and a member
+    with no persisted id has no identity field to survive that, so its
+    `spawn_run(agent=...)` child is a plain template run on the parent's store
+    with no member section -- neither the desk protocol nor the rules (the record
+    cannot say "this member, under that template"; a record-shape change for the
+    memory model). A continuation of
+    that child is a template turn: `run.py` takes the kind from the record, the
+    member refresh is skipped, the spawn template is kept, and no member is
+    looked up, so a renamed alias is not an error.
+    """
+    from unittest.mock import MagicMock
+
+    from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+    from kiro_crew.subagent import SubagentManager
+
+    config = KiroCrewConfig.load()
+    config.agents["scribe"] = KiroCrewAgentConfig(
+        kiro_agent="critic-runtime", description="A scribe with no persisted identity"
+    )
+    config.save()
+    write_member_rules(slug_for_name("scribe"), member="scribe", text="Scribe: keep every draft.")
+    legacy = ExecutionContext(
+        None, MemoryStoreRef("default"), "member", "critic-runtime", selection_name="scribe"
+    )
+    manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
+    child = manager._admission.resolve_spawn_execution(
+        parent_session_key="dashboard:scribe", agent="task-template", _record=legacy
+    )
+    assert (child.member_id, child.selection_kind, child.selection_name) == (
+        None,
+        "template",
+        "task-template",
+    )
+    assert child.template_id == "task-template"
+    assert child.store == legacy.store
+    prompt, _ = env.builder.build_message(
+        "Do the task",
+        True,
+        "subagent:delegate",
+        execution_context=child,
+        agent="task-template",
+        project=str(env.project),
+    )
+    assert "Execution task instructions." in prompt
+    assert "You are scribe." not in prompt
+    assert "[PERMANENT RULES" not in prompt
+    assert "[HOW YOU WORK]" not in prompt
+    continued = manager._admission.resolve_spawn_execution(
+        conversation_key="subagent:child", _record=child
+    )
+    assert continued.template_id == "task-template"
+    assert continued == child
+    config.agents["scribe-renamed"] = config.agents.pop("scribe")
+    config.save()
+    renamed = manager._admission.resolve_spawn_execution(
+        conversation_key="subagent:child", _record=child
+    )
+    assert renamed == child
+    env.forbidden.assert_not_called()
+
+
 @pytest.mark.parametrize("other_v2", [False, True])
 def test_captured_member_id_wins_over_another_members_alias(env, other_v2):
     from kiro_crew.execution_context import resolve_member_execution
@@ -737,6 +1013,47 @@ def test_absolute_resource_outside_a_linked_root_is_still_refused(env, tmp_path)
         essentials._resource_paths([f"file://{outside}"], linked_root, linked_root)
 
 
+def test_absolute_resource_in_link_spelling_admits_under_a_resolved_root(env, tmp_path):
+    """A link-spelled declaration must resolve against a realpath-spelled root.
+
+    The reverse of the installer case: a project root is stored resolved while
+    the template records the resource through the ``$HOME`` link, so neither
+    spelling of the root is a lexical prefix of the declaration.
+    """
+    from kiro_crew import member_essential_context as essentials
+
+    linked_root = tmp_path / "linked-root"
+    make_dir_link(linked_root, env.project)
+    real_root = Path(os.path.realpath(str(linked_root)))
+    declared = linked_root / "declared-guide.md"
+    paths = essentials._resource_paths([f"file://{declared}"], real_root, real_root)
+    assert paths, "a link-spelled resource under the resolved root was refused"
+    match, root = paths[0]
+    assert "Declared guide" in essentials._read(match, root)
+
+
+def test_link_spelled_resource_still_refuses_outside_and_links_below_root(env, tmp_path):
+    """Matching the root's link spelling admits neither a sibling nor a link below it."""
+    from kiro_crew import member_essential_context as essentials
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "guide.md").write_text("OUTSIDE_SECRET", encoding="utf-8")
+
+    linked_root = tmp_path / "linked-root"
+    make_dir_link(linked_root, env.project)
+    real_root = Path(os.path.realpath(str(linked_root)))
+    with pytest.raises(MemberEssentialContextError, match="outside"):
+        essentials._resource_paths([f"file://{outside / 'guide.md'}"], real_root, real_root)
+    make_dir_link(env.project / "escape", outside)
+    paths = essentials._resource_paths(
+        [f"file://{linked_root / 'escape' / 'guide.md'}"], real_root, real_root
+    )
+    with pytest.raises(MemberEssentialContextError, match="outside"):
+        for match, root in paths:
+            essentials._read(match, root)
+
+
 def test_owner_cleared_empty_anchors_are_valid_but_missing_source_refuses(env):
     env.memory._preferences_file.write_text("", encoding="utf-8")
     env.memory._projects_file.write_text("", encoding="utf-8")
@@ -799,7 +1116,6 @@ def test_malformed_declared_template_fields_refuse_explicitly(env, field, value)
 
 
 def test_linked_directory_is_refused_before_enumerating_outside_sources(env, tmp_path):
-    from conftest import make_dir_link
 
     target = tmp_path / "other-project"
     target.mkdir()
@@ -850,6 +1166,7 @@ def test_refused_workspace_root_is_never_resolved(env, monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("source", ["package", "development", "user-override"])
+@pytest.mark.parametrize("spec_uses_stub", [False, True], ids=["file-pointer", "native-stub"])
 @pytest.mark.parametrize(
     "fresh, options",
     [
@@ -861,7 +1178,7 @@ def test_refused_workspace_root_is_never_resolved(env, monkeypatch, tmp_path):
     ],
 )
 def test_inherited_product_prompt_uses_session_start_not_essentials(
-    env, tmp_path, monkeypatch, source, fresh, options
+    env, tmp_path, monkeypatch, source, spec_uses_stub, fresh, options
 ):
     from kiro_crew import agent
     from kiro_crew.config import config_dir
@@ -880,8 +1197,9 @@ def test_inherited_product_prompt_uses_session_start_not_essentials(
     prompt_path.write_text("PRODUCT_PROMPT_AT_SESSION_START", encoding="utf-8")
     assert agent._prompt_path() == prompt_path
     spec = env.project / ".kiro" / "agents" / "writer-template.json"
+    spec_prompt = agent._NATIVE_PROMPT_STUB if spec_uses_stub else f"file://{prompt_path}"
     spec.write_text(
-        json.dumps({"name": "writer-template", "prompt": f"file://{prompt_path}"}),
+        json.dumps({"name": "writer-template", "prompt": spec_prompt}),
         encoding="utf-8",
     )
 
@@ -900,6 +1218,45 @@ def test_inherited_product_prompt_uses_session_start_not_essentials(
     assert f"[Essential source: {prompt_path}]" not in message
     if fresh and not options.get("resumed"):
         assert message.count("PRODUCT_PROMPT_AT_SESSION_START") == 1
+    if spec_uses_stub:
+        # Essentials sanitise the stub's [AGENT SYSTEM PROMPT] markers, so a
+        # byte-exact match would miss a leak; assert on its marker-free tail.
+        assert "follow it as your authoritative contract" not in message
+    env.forbidden.assert_not_called()
+
+
+def test_managed_stub_reaches_owner_session_start(env, tmp_path, monkeypatch):
+    """A private-owner fork whose spec carries the native stub resolves to the
+    product contract at session start via the owner-template load, not the stub
+    text (see agent-spec-fields.md → Prompt)."""
+    from kiro_crew import agent
+
+    package = tmp_path / "installed-package" / "config"
+    monkeypatch.setattr(agent, "_BUNDLED_CFG_DIR", package)
+    monkeypatch.setattr(agent, "_project_dir", lambda: None)
+    prompt_path = package / "prompt.md"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("PRODUCT_PROMPT_AT_SESSION_START", encoding="utf-8")
+    assert agent._prompt_path() == prompt_path
+    spec = env.project / ".kiro" / "agents" / "writer-template.json"
+    spec.write_text(
+        json.dumps({"name": "writer-template", "prompt": agent._NATIVE_PROMPT_STUB}),
+        encoding="utf-8",
+    )
+
+    # agent="writer-template" == the member's own template, so the owner-template
+    # session-start load (context._load_agent_prompt) runs — not the direct read.
+    message, _ = env.builder.build_message(
+        "Continue",
+        True,
+        agent="writer-template",
+        memory_store=env.store,
+        member=env.member,
+        project=str(env.project),
+    )
+
+    assert message.count("PRODUCT_PROMPT_AT_SESSION_START") == 1
+    assert "follow it as your authoritative contract" not in message
     env.forbidden.assert_not_called()
 
 
@@ -1178,6 +1535,149 @@ def test_document_cap_still_bounds_declared_file_resources(env):
     with pytest.raises(MemberEssentialContextError, match="too many resources"):
         documents_for_member("writer-template", str(env.project))
     with pytest.raises(MemberEssentialContextError, match="exceeds the document limit"):
+        projected_resource_documents(
+            {"id": "writer-template", "resources": resources}, str(env.project)
+        )
+
+
+def test_object_form_declaration_reaches_the_launch_document_path(env):
+    """The launch path, not just the helper, has to admit an object declaration.
+
+    kiro-cli documents no string form for a knowledge base, so a member bound to
+    such a template could not start: the launch-document build refused the spec
+    before the child process existed.
+    """
+    from kiro_crew.member_essential_context import kiro_launch_documents
+
+    resources = [
+        "file://declared-guide.md",
+        {
+            "type": "knowledgeBase",
+            "source": "file://kb",
+            "name": "ProjectDocs",
+            "indexType": "best",
+            "include": ["**/*.md"],
+            "autoUpdate": True,
+        },
+    ]
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": resources}),
+        encoding="utf-8",
+    )
+    documents = kiro_launch_documents("writer-template", str(env.project))
+    assert "Declared guide: examples must be reproducible." in [body for _, body in documents]
+
+
+def test_object_form_declaration_is_admitted_and_read_by_nobody(env):
+    """Admitting the entry must not turn its source into an essential document.
+
+    No path is derived from the entry, so a readable directory of markdown
+    behind ``source`` contributes no text.
+    """
+    from kiro_crew.member_essential_context import (
+        documents_for_member,
+        projected_resource_documents,
+    )
+
+    source_dir = env.project / "kb"
+    source_dir.mkdir()
+    (source_dir / "inside.md").write_text("KB_SOURCE_BODY", encoding="utf-8")
+    resources = [
+        "file://declared-guide.md",
+        {"type": "knowledgeBase", "source": "file://kb", "name": "ProjectDocs"},
+    ]
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": resources}),
+        encoding="utf-8",
+    )
+    bodies = [body for _, body in documents_for_member("writer-template", str(env.project))]
+    assert "Declared guide: examples must be reproducible." in bodies
+    assert not any("KB_SOURCE_BODY" in body for body in bodies)
+
+    projected = projected_resource_documents(
+        {"id": "writer-template", "resources": resources}, str(env.project)
+    )
+    assert list(projected.values()) == ["Declared guide: examples must be reproducible."]
+
+
+def test_object_form_source_cannot_widen_the_admitted_roots(env):
+    """A source outside every admitted root is still not a location this reads.
+
+    A ``file://`` declaration that escaped its root would be refused by ``_read``;
+    an object declaration is never resolved at all. Spelled without ``name`` and
+    also declared alone, so admission depends neither on an optional key nor on
+    a ``file://`` sibling.
+    """
+    from kiro_crew.member_essential_context import (
+        documents_for_member,
+        kiro_launch_documents,
+        projected_resource_documents,
+    )
+
+    outside = env.project.parent / "outside-kb"
+    outside.mkdir()
+    (outside / "secret.md").write_text("OUTSIDE_ROOT_BODY", encoding="utf-8")
+    nameless = {"type": "knowledgeBase", "source": f"file://{outside}"}
+    resources = ["file://declared-guide.md", nameless]
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": resources}),
+        encoding="utf-8",
+    )
+    bodies = [body for _, body in documents_for_member("writer-template", str(env.project))]
+    assert "Declared guide: examples must be reproducible." in bodies
+    assert not any("OUTSIDE_ROOT_BODY" in body for body in bodies)
+
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": [nameless]}),
+        encoding="utf-8",
+    )
+    launched = kiro_launch_documents("writer-template", str(env.project))
+    assert not any("OUTSIDE_ROOT_BODY" in body for _, body in launched)
+    assert (
+        projected_resource_documents(
+            {"id": "writer-template", "resources": [nameless]}, str(env.project)
+        )
+        == {}
+    )
+
+
+def test_object_form_declarations_do_not_spend_the_document_budget(env):
+    """An entry nothing reads cannot exhaust the budget for entries that are read."""
+    from kiro_crew.member_essential_context import documents_for_member
+
+    knowledge_bases = [
+        {"type": "knowledgeBase", "source": f"file://kb-{index}", "name": f"kb-{index}"}
+        for index in range(70)
+    ]
+    resources = ["file://declared-guide.md", *knowledge_bases]
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": resources}),
+        encoding="utf-8",
+    )
+    documents = documents_for_member("writer-template", str(env.project))
+    assert "Declared guide: examples must be reproducible." in [body for _, body in documents]
+
+
+@pytest.mark.parametrize("malformed", [42, ["file://nested.md"], None])
+def test_resources_still_refuse_an_entry_that_is_neither_uri_nor_object(env, malformed):
+    """Admitting the object form is not the same as admitting anything.
+
+    kiro-cli refuses the same shapes (``resource must be a string (file:// or
+    skill://) or an object``). Asserted on the refusal, not its wording.
+    """
+    from kiro_crew.member_essential_context import (
+        documents_for_member,
+        projected_resource_documents,
+    )
+
+    resources = ["file://declared-guide.md", malformed]
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": resources}),
+        encoding="utf-8",
+    )
+    with pytest.raises(MemberEssentialContextError):
+        documents_for_member("writer-template", str(env.project))
+    with pytest.raises(MemberEssentialContextError):
         projected_resource_documents(
             {"id": "writer-template", "resources": resources}, str(env.project)
         )
